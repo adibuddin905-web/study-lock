@@ -20,10 +20,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pyinstaller pywebview
+        run: pip install pyinstaller pywebview pymupdf
 
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole --name StudyLock --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr study_lock.py
+        run: pyinstaller --onefile --noconsole --name StudyLock --collect-all webview --collect-all pythonnet --collect-all clr_loader --collect-all pymupdf --hidden-import clr study_lock.py
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4

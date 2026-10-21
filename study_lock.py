@@ -2,12 +2,13 @@
 StudyLock - focus sessions for Windows
 --------------------------------------
 Two separate modes:
-  * Self Study : full-screen lock, optional study audio, doubts notepad
+  * Self Study : full-screen lock, built-in PDF reader, optional study audio, doubts notepad
   * Lecture    : full-screen lock with a YouTube lecture (pause / resume / seek allowed)
+Prayer break pauses everything (timer, video, audio) and resumes later.
 Plus stopwatch, daily hours, streaks and a 14-day chart.
 
-Needs only Python 3.9+ (Windows). No pip packages for the main app.
-(The Lecture player uses 'pywebview', which the GitHub build installs for you.)
+Needs Python 3.9+ (Windows). Optional packages: pymupdf (PDF reader), pywebview (lecture player).
+The GitHub build installs both for you.
 Run:  pythonw study_lock.py
 """
 import sys, os, json, time, ctypes, re, queue, secrets, threading, subprocess
@@ -16,6 +17,7 @@ import urllib.parse
 import datetime as dt
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from tkinter import font as tkfont
 
 IS_WIN = sys.platform.startswith("win")
 APP_NAME = "StudyLock"
@@ -68,7 +70,8 @@ def today_key():
 def default_settings():
     return {
         "goal": 4,
-        "self": {"study": 50, "break": 10, "cycles": 4, "audio": "", "volume": 70},
+        "self": {"study": 50, "break": 10, "cycles": 4, "audio": "", "volume": 70,
+                 "pdfs": [], "pdf_state": {}, "pdf_night": True},
         "lecture": {"study": 50, "break": 10, "cycles": 2, "url": "", "pos": {}},
     }
 
@@ -295,60 +298,54 @@ def parse_youtube(url):
 PLAYER_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>StudyLock Lecture</title>
 <style>
-:root{--bg:#0d1117;--bar:#161b22;--line:#30363d;--text:#e6edf3;--mut:#8b949e;--acc:#a371f7;--btn:#21262d;--btnh:#2d333b}
+:root{--bg:#0d1117;--line:#30363d;--text:#e6edf3;--mut:#9aa4b2;--acc:#a371f7;--btn:rgba(48,54,61,.85);--btnh:rgba(68,76,86,.95)}
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:"Segoe UI",system-ui,sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none}
-body{display:flex;flex-direction:column}
-#top{flex:0 0 60px;display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:var(--bar);border-bottom:1px solid var(--line)}
-.brand{font-weight:700;font-size:16px;letter-spacing:.3px}
-.chip{margin-left:14px;font-size:12px;font-weight:700;color:var(--acc);background:rgba(163,113,247,.15);padding:5px 11px;border-radius:999px}
-#timerbox{text-align:right}
-#timer{font-size:30px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
-#tl{font-size:10px;color:var(--mut);letter-spacing:1px;margin-top:4px}
-#stage{flex:1;position:relative;background:#000;min-height:0}
+html,body{margin:0;height:100%;background:#000;color:var(--text);font-family:"Segoe UI",system-ui,sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none}
+body.nocursor{cursor:none}
+#stage{position:fixed;top:0;left:0;right:0;bottom:0;background:#000}
 #yt{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
-#shield{position:absolute;top:0;left:0;right:0;bottom:0;z-index:5;display:flex;align-items:center;justify-content:center;cursor:pointer}
-#paused{display:none;position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(13,17,23,.93);flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center}
-#paused .ic{width:84px;height:84px;border-radius:50%;background:var(--acc);display:flex;align-items:center;justify-content:center;font-size:34px;color:#fff;padding-left:6px}
-#paused .t{font-size:24px;font-weight:700}
-#paused .s{font-size:14px;color:var(--mut)}
-#msg{display:none;position:relative;z-index:2;background:rgba(22,27,34,.97);border:1px solid var(--line);padding:26px 34px;border-radius:14px;max-width:70%;line-height:1.6;font-size:18px;text-align:center;cursor:default}
-#ctl{flex:0 0 auto;padding:12px 28px 6px;background:var(--bar);border-top:1px solid var(--line)}
-#seekrow{display:flex;align-items:center;gap:12px;color:var(--mut);font-size:13px;font-variant-numeric:tabular-nums}
-#bar{flex:1;height:18px;display:flex;align-items:center;cursor:pointer}
-#track{width:100%;height:6px;background:#30363d;border-radius:4px;overflow:hidden}
+#shield{position:absolute;top:0;left:0;right:0;bottom:0;z-index:5;cursor:pointer}
+#chip{position:fixed;top:14px;left:18px;z-index:30;display:flex;align-items:baseline;gap:10px;padding:8px 14px;border-radius:12px;background:rgba(13,17,23,.66);border:1px solid rgba(255,255,255,.08)}
+#chip b{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+#chip span{font-size:11px;color:var(--mut);letter-spacing:.9px;text-transform:uppercase}
+.hud{position:fixed;left:0;right:0;z-index:20;transition:opacity .25s ease}
+.hud.hide{opacity:0;pointer-events:none}
+#hudTop{top:0;display:flex;justify-content:flex-end;align-items:center;gap:16px;padding:14px 18px;background:linear-gradient(rgba(0,0,0,.5),rgba(0,0,0,0))}
+.brand{font-weight:700;font-size:14px;letter-spacing:.3px;color:var(--mut)}
+#hudBot{bottom:0;padding:30px 22px 14px;background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.62))}
+#seekrow{display:flex;align-items:center;gap:12px;color:var(--text);font-size:13px;font-variant-numeric:tabular-nums}
+#bar{flex:1;height:20px;display:flex;align-items:center;cursor:pointer}
+#track{width:100%;height:5px;background:rgba(255,255,255,.28);border-radius:4px;overflow:hidden}
 #fill{height:100%;width:0;background:var(--acc)}
-#btns{display:flex;gap:10px;align-items:center;justify-content:center;padding:10px 0 6px}
-.b{font-family:inherit;border:0;border-radius:9px;background:var(--btn);color:var(--text);font-size:14px;font-weight:600;padding:10px 16px;cursor:pointer}
+#row{display:flex;gap:10px;align-items:center;padding-top:8px}
+.grp{display:flex;gap:6px}
+.b{font-family:inherit;border:0;border-radius:9px;background:var(--btn);color:var(--text);font-size:13px;font-weight:600;padding:9px 14px;cursor:pointer;white-space:nowrap}
 .b:hover{background:var(--btnh)}
 .b.main{background:var(--acc);color:#fff}
-.b.main:hover{filter:brightness(1.1)}
-#pp{min-width:110px}
-#dbt{flex:0 0 auto;display:flex;gap:10px;align-items:center;padding:8px 28px 16px;background:var(--bar)}
-#inp{flex:1;background:var(--btn);border:1px solid var(--line);border-radius:9px;color:var(--text);font-size:15px;padding:11px 14px;font-family:inherit;user-select:text;-webkit-user-select:text;outline:none}
+.b.main:hover{filter:brightness(1.12)}
+#pp{min-width:84px}
+#inp{flex:1;min-width:120px;background:rgba(13,17,23,.78);border:1px solid var(--line);border-radius:9px;color:var(--text);font-size:14px;padding:9px 12px;font-family:inherit;user-select:text;-webkit-user-select:text;outline:none}
 #inp:focus{border-color:var(--acc)}
-#cnt{color:var(--mut);min-width:130px;text-align:right;font-size:13px}
-#note{color:var(--mut);font-size:12px;text-align:center;padding:0 0 8px;background:var(--bar)}
+#cnt{color:var(--mut);font-size:12px;min-width:90px;text-align:right}
+#msg{display:none;position:fixed;z-index:40;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(22,27,34,.97);border:1px solid var(--line);padding:26px 34px;border-radius:14px;max-width:70%;line-height:1.6;font-size:18px;text-align:center}
 </style></head><body>
-<div id="top"><div style="display:flex;align-items:center"><span class="brand">StudyLock &middot; Lecture</span><span class="chip" id="phase">Session</span></div>
-<div id="timerbox"><div id="timer">--:--</div><div id="tl">FOCUS TIME LEFT</div></div></div>
-<div id="stage"><div id="yt"></div>
-<div id="shield" onclick="shieldClick(event)"><div id="paused"><div class="ic">&#9654;</div><div class="t">Paused</div><div class="s">The focus timer keeps running. Press Space or click to resume.</div></div>
-<div id="msg"></div></div></div>
-<div id="ctl">
+<div id="stage"><div id="yt"></div><div id="shield" onclick="toggle()"></div></div>
+<div id="chip"><span id="phase">Session</span><b id="timer">--:--</b></div>
+<div id="hudTop" class="hud"><span class="brand">StudyLock &middot; Lecture</span><button class="b" onclick="prayer()">Prayer break</button></div>
+<div id="hudBot" class="hud">
 <div id="seekrow"><span id="cur">0:00</span><div id="bar"><div id="track"><div id="fill"></div></div></div><span id="dur">0:00</span></div>
-<div id="btns">
-<button class="b" onclick="seek(-30)">&minus;30s</button><button class="b" onclick="seek(-10)">&minus;10s</button>
+<div id="row">
+<div class="grp"><button class="b" onclick="seek(-30)">&minus;30s</button><button class="b" onclick="seek(-10)">&minus;10s</button>
 <button id="pp" class="b main" onclick="toggle()">Pause</button>
 <button class="b" onclick="seek(10)">+10s</button><button class="b" onclick="seek(30)">+30s</button>
-<button id="spd" class="b" onclick="cycleSpeed()">1x</button>
+<button id="spd" class="b" onclick="cycleSpeed()">1x</button></div>
+<input id="inp" placeholder="Write a doubt, press Enter (video time is added automatically)" autocomplete="off">
+<button class="b main" onclick="saveDoubt()">Save doubt</button><span id="cnt"></span>
 </div></div>
-<div id="dbt"><input id="inp" placeholder="Write a doubt and press Enter - the video time is added automatically" autocomplete="off">
-<button class="b main" onclick="saveDoubt()">Save doubt</button><span id="cnt"></span></div>
-<div id="note">Shortcuts: Space = pause / resume &nbsp;&middot;&nbsp; Left / Right = &minus;10s / +10s</div>
+<div id="msg"></div>
 <script>
 var K=new URLSearchParams(location.search).get('k');
-var S=null,player=null,ready=false,started=false,ended=false,lastSave=0,count=0;
+var S=null,player=null,ready=false,started=false,ended=false,paused=false,lastSave=0,count=0,lastMove=Date.now(),hover=false;
 var SPEEDS=[1,1.25,1.5,1.75,2],si=0;
 function $(id){return document.getElementById(id);}
 function pad(n){return String(n).padStart(2,'0');}
@@ -358,18 +355,18 @@ function api(path,body){return fetch(path+'?k='+encodeURIComponent(K),{method:bo
 function showMsg(h){var m=$('msg');m.innerHTML=h;m.style.display='block';}
 function hideMsg(){$('msg').style.display='none';}
 function begin(){hideMsg();try{player.playVideo();}catch(e){}}
+function prayer(){api('/prayer',{});}
 function toggle(){
  if(!ready)return;
  if(ended){ended=false;hideMsg();player.seekTo(0,true);player.playVideo();return;}
  var st=player.getPlayerState();
  if(st===1||st===3){player.pauseVideo();}else{player.playVideo();}
 }
-function shieldClick(e){if(e.target.closest&&e.target.closest('#msg'))return;toggle();}
 function seek(d){if(!ready)return;var t=player.getCurrentTime()+d,dur=player.getDuration();
  t=Math.max(0,dur>5?Math.min(t,dur-2):t);player.seekTo(t,true);}
 function cycleSpeed(){si=(si+1)%SPEEDS.length;if(ready)player.setPlaybackRate(SPEEDS[si]);$('spd').textContent=SPEEDS[si]+'x';}
 function saveDoubt(){var v=$('inp').value.trim();if(!v)return;var t=ready?player.getCurrentTime():0;
- api('/doubt',{text:v,t:t}).then(function(){count++;$('cnt').textContent=count+' doubt(s) saved';$('inp').value='';});}
+ api('/doubt',{text:v,t:t}).then(function(){count++;$('cnt').textContent=count+' saved';$('inp').value='';});}
 $('inp').addEventListener('keydown',function(e){if(e.key==='Enter'){saveDoubt();}});
 $('bar').addEventListener('click',function(e){
  if(!ready)return;var r=this.getBoundingClientRect(),f=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));
@@ -382,14 +379,22 @@ document.addEventListener('keydown',function(e){
  if(e.ctrlKey||e.altKey||/^F\d+$/.test(e.key))e.preventDefault();
 },true);
 document.addEventListener('contextmenu',function(e){e.preventDefault();});
+['mousemove','mousedown','keydown','touchstart'].forEach(function(ev){document.addEventListener(ev,function(){lastMove=Date.now();},true);});
+['hudTop','hudBot'].forEach(function(id){var el=$(id);
+ el.addEventListener('mouseenter',function(){hover=true;});el.addEventListener('mouseleave',function(){hover=false;});});
+setInterval(function(){
+ var show=paused||hover||document.activeElement===$('inp')||(Date.now()-lastMove<3000)||!started;
+ $('hudTop').classList.toggle('hide',!show);$('hudBot').classList.toggle('hide',!show);
+ document.body.classList.toggle('nocursor',!show);
+},250);
 function onReady(){ready=true;player.playVideo();
- setTimeout(function(){if(!started)showMsg('<button class="b main" onclick="begin()">&#9654; Start lecture</button>');},4000);}
+ setTimeout(function(){if(!started)showMsg('<button class="b main" style="font-size:16px;padding:12px 22px" onclick="begin()">&#9654; Start lecture</button>');},4000);}
 function onState(e){var st=e.data,pp=$('pp');
- if(st===1){started=true;ended=false;hideMsg();$('paused').style.display='none';pp.textContent='Pause';}
- else if(st===2){if(started)$('paused').style.display='flex';pp.textContent='Resume';}
- else if(st===0){ended=true;pp.textContent='Replay';$('paused').style.display='none';
+ if(st===1){started=true;ended=false;paused=false;hideMsg();pp.textContent='Pause';}
+ else if(st===2){paused=started;pp.textContent='Resume';}
+ else if(st===0){ended=true;paused=true;pp.textContent='Replay';
   showMsg('Lecture finished.<br>The timer is still running - use the time to write down your doubts.');}}
-function onError(e){showMsg('This video cannot be played here (error '+e.data+').<br>The owner may have disabled embedding, or the link is wrong.<br>Close this session after the timer and try another video.');}
+function onError(e){showMsg('This video cannot be played here (error '+e.data+').<br>The owner may have disabled embedding, or the link is wrong.<br>Try another video after this session.');}
 window.onYouTubeIframeAPIReady=function(){
  player=new YT.Player('yt',{videoId:S.video_id,playerVars:{autoplay:1,controls:0,disablekb:1,fs:0,rel:0,modestbranding:1,playsinline:1,iv_load_policy:3,start:Math.floor(S.start||0)},
   events:{onReady:onReady,onStateChange:onState,onError:onError}});};
@@ -400,7 +405,7 @@ setInterval(function(){
   $('cur').textContent=fmt(t);$('dur').textContent=fmt(d);$('fill').style.width=(d>0?Math.min(100,t/d*100):0)+'%';
   if(Date.now()-lastSave>4000){lastSave=Date.now();api('/pos',{t:t});}}
 },400);
-api('/state').then(function(s){S=s;$('phase').textContent='Session '+S.cycle+' of '+S.cycles;$('cnt').textContent=S.doubts+' doubt(s) in list';
+api('/state').then(function(s){S=s;$('phase').textContent='Session '+S.cycle+' of '+S.cycles;$('cnt').textContent=S.doubts+' in list';
  var sc=document.createElement('script');sc.src='https://www.youtube.com/iframe_api';
  sc.onerror=function(){showMsg('Could not load YouTube. Please check your internet connection.');};document.head.appendChild(sc);});
 </script></body></html>
@@ -457,6 +462,8 @@ class LectureServer:
                         srv.app.q_doubts.put(body)
                     elif path == "/pos":
                         srv.app.lecture_pos = float(body.get("t", 0) or 0)
+                    elif path == "/prayer":
+                        srv.app.q_cmds.put("prayer")
                 except Exception:
                     pass
                 self._send(200, "{}")
@@ -494,41 +501,83 @@ BTN_KINDS = {
     "secondary": (SURFACE2, TEXT, "#30363d"),
     "danger":    ("#3d1417", DANGER, "#59191d"),
     "success":   ("#10361c", GOOD, "#17502a"),
+    "warn":      ("#3b2a08", WARN, "#563d0c"),
 }
 DIS_BG, DIS_FG = "#1b2028", "#5b626c"
 
 
-class Btn(tk.Label):
-    """Flat button built on a Label (hover effect, enable / disable)."""
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
+           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
 
-    def __init__(self, parent, text, command=None, kind="secondary", size=10, padx=18, pady=9):
-        self.c_bg, self.c_fg, self.c_hv = BTN_KINDS[kind]
+
+class Btn(tk.Canvas):
+    """Rounded flat button (hover effect, enable / disable, stretches with pack(fill='x'))."""
+
+    def __init__(self, parent, text, command=None, kind="secondary", size=10, padx=18, pady=9, radius=9):
         self.cmd = command
         self.enabled = True
-        super().__init__(parent, text=text, bg=self.c_bg, fg=self.c_fg, font=(FONT, size, "bold"),
-                         padx=padx, pady=pady, cursor="hand2")
+        self._hover = False
+        self._text = text
+        self._r = radius
+        self._padx, self._pady = padx, pady
+        self._font = tkfont.Font(family=FONT, size=size, weight="bold")
+        self._colors = BTN_KINDS[kind]
+        try:
+            pbg = parent.cget("bg")
+        except Exception:
+            pbg = SURFACE
+        w, h = self._min_size()
+        super().__init__(parent, width=w, height=h, bg=pbg, highlightthickness=0, cursor="hand2")
+        self.bind("<Configure>", self._draw)
         self.bind("<Enter>", self._enter)
         self.bind("<Leave>", self._leave)
         self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _min_size(self):
+        return (self._font.measure(self._text) + 2 * self._padx,
+                self._font.metrics("linespace") + 2 * self._pady)
+
+    def _draw(self, event=None):
+        mw, mh = self._min_size()
+        w = event.width if event is not None else max(self.winfo_width(), mw)
+        h = event.height if event is not None else max(self.winfo_height(), mh)
+        c_bg, c_fg, c_hv = self._colors
+        bg = (c_hv if self._hover else c_bg) if self.enabled else DIS_BG
+        fg = c_fg if self.enabled else DIS_FG
+        self.delete("all")
+        round_rect(self, 1, 1, w - 1, h - 1, self._r, fill=bg, outline="")
+        self.create_text(w / 2, h / 2, text=self._text, fill=fg, font=self._font)
 
     def _enter(self, e):
-        if self.enabled:
-            self.config(bg=self.c_hv)
+        self._hover = True
+        self._draw()
 
     def _leave(self, e):
-        self.config(bg=self.c_bg if self.enabled else DIS_BG)
+        self._hover = False
+        self._draw()
 
     def _click(self, e):
         if self.enabled and self.cmd:
             self.cmd()
 
     def enable(self, on=True):
-        self.enabled = on
-        self.config(bg=self.c_bg if on else DIS_BG, fg=self.c_fg if on else DIS_FG,
-                    cursor="hand2" if on else "arrow")
+        if on != self.enabled:
+            self.enabled = on
+            self.config(cursor="hand2" if on else "arrow")
+            self._draw()
 
     def set_text(self, text):
-        self.config(text=text)
+        if text != self._text:
+            self._text = text
+            self.config(width=self._min_size()[0])
+            self._draw()
+
+    def set_kind(self, kind):
+        self._colors = BTN_KINDS[kind]
+        self._draw()
 
 
 def card(parent, title=None, pad=16):
@@ -538,7 +587,7 @@ def card(parent, title=None, pad=16):
     inner.pack(fill="both", expand=True, padx=1, pady=1)
     if title:
         tk.Label(inner, text=title.upper(), bg=SURFACE, fg=MUTED,
-                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(0, 12))
+                 font=(FONT, 9, "bold")).pack(anchor="w", pady=(0, 10))
     return outer, inner
 
 
@@ -556,9 +605,13 @@ def make_listbox(parent, height=5):
 
 def page_header(parent, title, subtitle):
     head = tk.Frame(parent, bg=BG)
-    head.pack(fill="x", pady=(0, 18))
-    tk.Label(head, text=title, bg=BG, fg=TEXT, font=(FONT, 22, "bold")).pack(anchor="w")
-    tk.Label(head, text=subtitle, bg=BG, fg=MUTED, font=(FONT, 10)).pack(anchor="w", pady=(2, 0))
+    head.pack(fill="x", pady=(0, 16))
+    left = tk.Frame(head, bg=BG)
+    left.pack(side="left")
+    tk.Label(left, text=title, bg=BG, fg=TEXT, font=(FONT, 22, "bold")).pack(anchor="w")
+    tk.Label(left, text=subtitle, bg=BG, fg=MUTED, font=(FONT, 10)).pack(anchor="w", pady=(2, 0))
+    tk.Label(head, text=dt.date.today().strftime("%A, %d %B %Y"), bg=BG, fg=MUTED,
+             font=(FONT, 10)).pack(side="right", anchor="s")
 
 
 class Stepper(tk.Frame):
@@ -571,12 +624,12 @@ class Stepper(tk.Frame):
         tk.Label(self, text=label, bg=bg, fg=MUTED, font=(FONT, 9, "bold")).pack(anchor="w")
         row = tk.Frame(self, bg=bg)
         row.pack(pady=(6, 0))
-        Btn(row, "\u2212", lambda: self.bump(-1), "secondary", size=12, padx=12, pady=4).pack(side="left")
+        Btn(row, "\u2212", lambda: self.bump(-1), "secondary", size=12, padx=12, pady=3).pack(side="left")
         self.entry = tk.Entry(row, textvariable=self.var, width=4, justify="center", bg=SURFACE2, fg=TEXT,
                               insertbackground=TEXT, relief="flat", font=(FONT, 14, "bold"),
                               highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACC)
         self.entry.pack(side="left", padx=6, ipady=5)
-        Btn(row, "+", lambda: self.bump(1), "secondary", size=12, padx=12, pady=4).pack(side="left")
+        Btn(row, "+", lambda: self.bump(1), "secondary", size=12, padx=12, pady=3).pack(side="left")
         self.entry.bind("<FocusOut>", lambda e: self._commit())
 
     def peek(self):
@@ -645,9 +698,242 @@ class Bar(tk.Canvas):
             self.create_rectangle(0, 0, w * self.frac, self.h, fill=self.color, outline="")
 
 
+# ----------------------------------------------------------------- PDF viewer (PyMuPDF)
+def load_fitz():
+    try:
+        import pymupdf as fitz
+        return fitz
+    except Exception:
+        pass
+    try:
+        import fitz
+        return fitz
+    except Exception:
+        return None
+
+
+class PdfViewer(tk.Frame):
+    """PDF reader inside the lock screen: pages, zoom, night mode, remembers your page."""
+
+    def __init__(self, parent, app, paths, accent=ACC):
+        super().__init__(parent, bg=LOCK_BG)
+        self.app, self.paths, self.accent = app, list(paths), accent
+        self.fitz = load_fitz()
+        self.docs = {}
+        self.doc = None
+        self.idx = 0
+        self.page = 0
+        self.zoom = None          # None = fit to width
+        self.scale = 1.0
+        self._img = None
+        self._job = None
+        self.night = bool(app.data["settings"]["self"].get("pdf_night", True))
+
+        bar = tk.Frame(self, bg=SURFACE)
+        bar.pack(fill="x")
+        inner = tk.Frame(bar, bg=SURFACE)
+        inner.pack(fill="x", padx=10, pady=8)
+        self.tabs = []
+        if len(self.paths) > 1:
+            trow = tk.Frame(inner, bg=SURFACE)
+            trow.pack(fill="x", pady=(0, 8))
+            for i, p in enumerate(self.paths):
+                name = os.path.basename(p)
+                name = name if len(name) <= 26 else name[:23] + "..."
+                b = Btn(trow, name, lambda i=i: self.open(i), "secondary", size=9, padx=12, pady=5)
+                b.pack(side="left", padx=(0, 6))
+                self.tabs.append(b)
+        row = tk.Frame(inner, bg=SURFACE)
+        row.pack(fill="x")
+        Btn(row, "Prev", self.prev, "secondary", size=9, padx=12, pady=5).pack(side="left")
+        self.v_page = tk.StringVar(value="1")
+        e = tk.Entry(row, textvariable=self.v_page, width=5, justify="center", bg=SURFACE2, fg=TEXT,
+                     insertbackground=TEXT, relief="flat", font=(FONT, 11, "bold"),
+                     highlightthickness=1, highlightbackground=BORDER, highlightcolor=accent)
+        e.pack(side="left", padx=8, ipady=3)
+        e.bind("<Return>", self.jump)
+        self.lbl_total = tk.Label(row, text="/ 0", bg=SURFACE, fg=MUTED, font=(FONT, 10, "bold"))
+        self.lbl_total.pack(side="left", padx=(0, 8))
+        Btn(row, "Next", self.next, "secondary", size=9, padx=12, pady=5).pack(side="left")
+        self.btn_night = Btn(row, "Night mode: on" if self.night else "Night mode: off",
+                             self.toggle_night, "secondary", size=9, padx=12, pady=5)
+        self.btn_night.pack(side="right")
+        Btn(row, "\u2212", self.zoom_out, "secondary", size=10, padx=12, pady=4).pack(side="right", padx=(0, 6))
+        Btn(row, "Fit", self.zoom_fit, "secondary", size=9, padx=12, pady=5).pack(side="right", padx=(0, 6))
+        Btn(row, "+", self.zoom_in, "secondary", size=10, padx=12, pady=4).pack(side="right", padx=(0, 6))
+
+        self.cv = tk.Canvas(self, bg="#0b0e14", highlightthickness=0, yscrollincrement=40, takefocus=1)
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<Configure>", lambda ev: self.schedule())
+        self.cv.bind("<MouseWheel>", self.on_wheel)
+        self.cv.bind("<Button-1>", lambda ev: self.cv.focus_set())
+        for k in ("<Right>", "<Next>"):
+            self.cv.bind(k, lambda ev: self.next())
+        for k in ("<Left>", "<Prior>"):
+            self.cv.bind(k, lambda ev: self.prev())
+        self.cv.bind("<Down>", lambda ev: self.cv.yview_scroll(2, "units"))
+        self.cv.bind("<Up>", lambda ev: self.cv.yview_scroll(-2, "units"))
+
+    # ---- document handling
+    def message(self, text):
+        self.doc = None
+        self.cv.delete("all")
+        self.cv.create_text(max(200, self.cv.winfo_width() / 2), 120, text=text, fill=MUTED,
+                            font=(FONT, 12), width=520, justify="center")
+
+    def open(self, i):
+        self.idx = max(0, min(i, len(self.paths) - 1))
+        path = self.paths[self.idx]
+        for j, b in enumerate(self.tabs):
+            b.set_kind("primary" if j == self.idx else "secondary")
+        self.doc = None
+        if not self.fitz:
+            self.message("The PDF viewer is not available in this build (PyMuPDF is missing).")
+            return
+        try:
+            if path not in self.docs:
+                self.docs[path] = self.fitz.open(path)
+            doc = self.docs[path]
+            if doc.needs_pass:
+                self.message("This PDF is password protected. Password-protected PDFs are not supported.")
+                return
+            if len(doc) == 0:
+                self.message("This PDF has no pages.")
+                return
+            self.doc = doc
+        except Exception as ex:
+            self.message(f"Could not open this PDF:\n{os.path.basename(path)}\n\n{ex}")
+            return
+        st = self.app.data["settings"]["self"].setdefault("pdf_state", {}).get(path, {})
+        try:
+            self.page = max(0, min(int(st.get("page", 0)), len(self.doc) - 1))
+        except Exception:
+            self.page = 0
+        self.zoom = None
+        self.lbl_total.config(text=f"/ {len(self.doc)}")
+        self.render(top=True)
+
+    def schedule(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.after(150, self.render)
+
+    def render(self, top=False, bottom=False):
+        self._job = None
+        if not self.doc:
+            return
+        cw = self.cv.winfo_width()
+        if cw < 60:
+            return
+        try:
+            page = self.doc[self.page]
+            width = max(1.0, page.rect.width)
+            scale = (cw - 40) / width if self.zoom is None else self.zoom
+            scale = max(0.3, min(4.0, scale))
+            self.scale = scale
+            pix = page.get_pixmap(matrix=self.fitz.Matrix(scale, scale), alpha=False)
+            if self.night:
+                pix.invert_irect(pix.irect)
+            self._img = tk.PhotoImage(data=pix.tobytes("ppm"))
+        except Exception as ex:
+            self.message(f"Could not draw this page.\n\n{ex}")
+            return
+        self.cv.delete("all")
+        x = max(20, (cw - pix.width) // 2)
+        self.cv.create_image(x, 16, anchor="nw", image=self._img)
+        self.cv.config(scrollregion=(0, 0, max(cw, pix.width + 40), pix.height + 32))
+        self.v_page.set(str(self.page + 1))
+        if bottom:
+            self.cv.yview_moveto(1.0)
+        elif top:
+            self.cv.yview_moveto(0.0)
+        self.save_state()
+
+    def save_state(self):
+        st = self.app.data["settings"]["self"]
+        st.setdefault("pdf_state", {})[self.paths[self.idx]] = {"page": self.page}
+        st["pdf_night"] = self.night
+
+    # ---- navigation
+    def goto(self, n, top=True, bottom=False):
+        if not self.doc:
+            return
+        n = max(0, min(n, len(self.doc) - 1))
+        if n == self.page and not (top or bottom):
+            return
+        self.page = n
+        self.render(top=top, bottom=bottom)
+
+    def next(self):
+        if self.doc and self.page < len(self.doc) - 1:
+            self.goto(self.page + 1)
+
+    def prev(self):
+        if self.doc and self.page > 0:
+            self.goto(self.page - 1)
+
+    def jump(self, e=None):
+        try:
+            n = int(self.v_page.get()) - 1
+        except ValueError:
+            n = self.page
+        self.goto(n)
+        self.cv.focus_set()
+
+    def on_wheel(self, e):
+        if not self.doc:
+            return
+        if e.state & 0x4:                       # Ctrl + wheel = zoom
+            self.zoom_in() if e.delta > 0 else self.zoom_out()
+            return
+        d = -1 if e.delta > 0 else 1
+        top, bot = self.cv.yview()
+        if d > 0 and bot >= 0.999:
+            if self.page < len(self.doc) - 1:
+                self.goto(self.page + 1)
+        elif d < 0 and top <= 0.001:
+            if self.page > 0:
+                self.goto(self.page - 1, top=False, bottom=True)
+        else:
+            self.cv.yview_scroll(d * 3, "units")
+
+    def zoom_in(self):
+        self.zoom = min(4.0, self.scale * 1.2)
+        self.render()
+
+    def zoom_out(self):
+        self.zoom = max(0.3, self.scale / 1.2)
+        self.render()
+
+    def zoom_fit(self):
+        self.zoom = None
+        self.render(top=True)
+
+    def toggle_night(self):
+        self.night = not self.night
+        self.btn_night.set_text("Night mode: on" if self.night else "Night mode: off")
+        self.render()
+
+    def close(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        for d in self.docs.values():
+            try:
+                d.close()
+            except Exception:
+                pass
+        self.docs.clear()
+
+
 # ----------------------------------------------------------------- pages
 class SessionView(tk.Frame):
-    """One page per mode ('self' or 'lecture'): timer, settings, source card, doubts."""
+    """One page per mode ('self' or 'lecture'): timer, settings, source cards, doubts."""
 
     def __init__(self, parent, app, mode):
         super().__init__(parent, bg=BG)
@@ -656,12 +942,12 @@ class SessionView(tk.Frame):
         self.kind = "primary" if mode == "self" else "violet"
         st = app.data["settings"][mode]
         self._last = None
-        self._break_btns = False
+        self._btnkey = None
 
         if mode == "self":
-            page_header(self, "Self Study", "Lock your screen and study from your books. Distractions stay out.")
+            page_header(self, "Self Study", "Lock your screen and study from your books or PDFs.")
         else:
-            page_header(self, "Lecture", "Watch a YouTube lecture on a locked screen. Pause, resume and seek freely.")
+            page_header(self, "Lecture", "Watch a YouTube lecture on a locked screen. Pause and seek freely.")
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True)
@@ -673,12 +959,15 @@ class SessionView(tk.Frame):
         lo.grid(row=0, column=0, sticky="ns", padx=(0, 16))
         self.ring = Ring(li, size=250, thick=12, bg=SURFACE, color=self.accent)
         self.ring.pack()
-        self.lbl_status = tk.Label(li, text="", bg=SURFACE, fg=MUTED, font=(FONT, 10), wraplength=250)
+        self.lbl_status = tk.Label(li, text="", bg=SURFACE, fg=MUTED, font=(FONT, 10), wraplength=250,
+                                   justify="center")
         self.lbl_status.pack(pady=(14, 14))
         self.btn_start = Btn(li, "Start session", lambda: app.start_session(mode), self.kind, size=11, pady=11)
         self.btn_start.pack(fill="x")
-        self.btn_skip = Btn(li, "Skip break", app.skip_break, "secondary", pady=9)
-        self.btn_end = Btn(li, "End session", app.stop_session, "danger", pady=9)
+        self.btn_resume = Btn(li, "Resume", app.resume_session, "success", size=11, pady=11)
+        self.btn_skip = Btn(li, "Skip break", app.skip_break, "secondary")
+        self.btn_prayer = Btn(li, "Prayer break", app.pause_session, "warn")
+        self.btn_end = Btn(li, "End session", app.stop_session, "danger")
 
         # ---- right column
         right = tk.Frame(body, bg=BG)
@@ -697,12 +986,13 @@ class SessionView(tk.Frame):
 
         if mode == "self":
             self._build_audio_card(right)
+            self._build_pdf_card(right)
         else:
             self._build_lecture_card(right, st)
 
         do, di = card(right, "Doubts to clear in your break")
         do.pack(fill="both", expand=True, pady=(12, 0))
-        self.lb = make_listbox(di, height=4)
+        self.lb = make_listbox(di, height=3)
         self.lb.pack(fill="both", expand=True)
         r = tk.Frame(di, bg=SURFACE)
         r.pack(fill="x", pady=(10, 0))
@@ -722,22 +1012,30 @@ class SessionView(tk.Frame):
         self.audio_name = tk.StringVar(value="No file selected")
         tk.Label(row, textvariable=self.audio_name, bg=SURFACE, fg=TEXT, font=(FONT, 10),
                  anchor="w").pack(side="left", fill="x", expand=True)
-        Btn(row, "Choose file", self.app.pick_audio, "secondary").pack(side="left", padx=6)
-        self.btn_play = Btn(row, "Play", self.app.toggle_audio, "secondary")
-        self.btn_play.pack(side="left")
-        vr = tk.Frame(ai, bg=SURFACE)
-        vr.pack(fill="x", pady=(10, 0))
-        tk.Label(vr, text="Volume", bg=SURFACE, fg=MUTED, font=(FONT, 9, "bold")).pack(side="left", padx=(0, 10))
-        self.vol = tk.Scale(vr, from_=0, to=100, orient="horizontal", showvalue=False, bg=SURFACE,
+        self.vol = tk.Scale(row, from_=0, to=100, orient="horizontal", showvalue=False, bg=SURFACE,
                             troughcolor=SURFACE2, highlightthickness=0, bd=0, sliderrelief="flat",
-                            width=12, sliderlength=22, activebackground=ACC)
+                            width=12, sliderlength=22, activebackground=ACC, length=120)
         self.vol.set(self.app.data["settings"]["self"]["volume"])
         self.vol.config(command=self.app.on_volume)
-        self.vol.pack(side="left", fill="x", expand=True)
-        tk.Label(ai, text="Plays automatically during focus sessions and pauses in breaks. "
-                          "Audio plays only inside this app.",
-                 bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
-                 wraplength=520).pack(anchor="w", pady=(8, 0))
+        self.vol.pack(side="right", padx=(10, 0))
+        self.btn_play = Btn(row, "Play", self.app.toggle_audio, "secondary")
+        self.btn_play.pack(side="right", padx=6)
+        Btn(row, "Choose file", self.app.pick_audio, "secondary").pack(side="right")
+
+    def _build_pdf_card(self, right):
+        po, pi = card(right, "Study material (PDF)")
+        po.pack(fill="x", pady=(12, 0))
+        row = tk.Frame(pi, bg=SURFACE)
+        row.pack(fill="x")
+        self.lb_pdf = make_listbox(row, height=3)
+        self.lb_pdf.pack(side="left", fill="x", expand=True)
+        col = tk.Frame(row, bg=SURFACE)
+        col.pack(side="left", padx=(10, 0))
+        Btn(col, "Add PDF", self.app.add_pdfs, "secondary").pack(fill="x")
+        Btn(col, "Remove", lambda: self.app.remove_pdf(self.lb_pdf), "secondary").pack(fill="x", pady=(6, 0))
+        tk.Label(pi, text="Selected PDFs open inside the locked study screen. "
+                          "Your page and night mode are remembered.",
+                 bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w").pack(anchor="w", pady=(8, 0))
 
     def _build_lecture_card(self, right, st):
         lo, li = card(right, "YouTube lecture")
@@ -753,10 +1051,10 @@ class SessionView(tk.Frame):
         Btn(row, "Reset position", self.reset_pos, "secondary").pack(side="left")
         self.lbl_lec = tk.Label(li, text="", bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w")
         self.lbl_lec.pack(anchor="w", pady=(8, 0))
-        tk.Label(li, text="You can pause, resume, seek and change speed during the lecture. "
-                          "The focus timer keeps running while paused. Playback resumes where you left off.",
+        tk.Label(li, text="Pause, resume, seek and change speed any time. The focus timer keeps running while "
+                          "paused. Use Prayer break to stop everything and resume later.",
                  bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
-                 wraplength=520).pack(anchor="w", pady=(4, 0))
+                 wraplength=560).pack(anchor="w", pady=(4, 0))
 
     def paste_url(self):
         try:
@@ -787,45 +1085,61 @@ class SessionView(tk.Frame):
             self.lbl_lec.config(text=f"Link OK  \u00b7  starts at {vt(pos)}", fg=GOOD)
 
     # ---- rendering (called every tick)
+    def _layout_buttons(self, key):
+        if key == self._btnkey:
+            return
+        self._btnkey = key
+        for b in (self.btn_resume, self.btn_skip, self.btn_prayer, self.btn_end):
+            b.pack_forget()
+        if key == "break":
+            self.btn_skip.pack(fill="x", pady=(8, 0))
+            self.btn_prayer.pack(fill="x", pady=(8, 0))
+            self.btn_end.pack(fill="x", pady=(8, 0))
+        elif key == "paused":
+            self.btn_resume.pack(fill="x", pady=(8, 0))
+            self.btn_end.pack(fill="x", pady=(8, 0))
+
     def render(self):
         app = self.app
         mine = app.phase != "idle" and app.mode == self.mode
+        key = "idle"
+        status_fg = MUTED
         if mine and app.phase == "study":
             rem = max(0.0, app.phase_end - time.time())
             frac = 1 - rem / max(1, app.phase_total)
-            state = (ms(rem), "FOCUS", app.cycle, "study")
             vals = (frac, ms(rem), "FOCUS", self.accent,
                     f"Focus \u00b7 session {app.cycle} of {app.cycles}")
         elif mine and app.phase == "break":
             rem = max(0.0, app.phase_end - time.time())
             frac = 1 - rem / max(1, app.phase_total)
-            state = (ms(rem), "BREAK", app.cycle, "break")
             vals = (frac, ms(rem), "BREAK", GOOD,
                     f"Break \u00b7 clear your doubts ({app.cycle} of {app.cycles} done)")
+            key, status_fg = "break", GOOD
+        elif mine and app.phase == "paused":
+            frac = 1 - app.paused_rem / max(1, app.phase_total)
+            away = ms(time.time() - app.paused_at)
+            vals = (frac, ms(app.paused_rem), "PAUSED", WARN,
+                    f"Prayer break \u00b7 everything is paused ({away}).\nPress Resume when you are back.")
+            key, status_fg = "paused", WARN
         else:
             mins = self.s_study.peek()
-            state = (mins, "READY", 0, "idle", app.phase != "idle", app.end_msg if not mine else "")
-            msg = app.end_msg if (app.end_msg and app.phase == "idle" and app.mode == self.mode) \
-                else ("Another session is running." if app.phase != "idle" else "Ready when you are.")
+            if app.phase != "idle":
+                msg = "Another session is running."
+            elif app.end_msg and app.mode == self.mode:
+                msg = app.end_msg
+            else:
+                msg = "Ready when you are."
             vals = (0.0, f"{mins:02d}:00", "READY", self.accent, msg)
-        if state == self._last:
+        if vals == self._last:
             return
-        self._last = state
+        self._last = vals
         frac, text, sub, color, status = vals
         self.ring.set(frac, text, sub, color)
-        self.lbl_status.config(text=status, fg=GOOD if (mine and app.phase == "break") else MUTED)
+        self.lbl_status.config(text=status, fg=status_fg)
         idle = app.phase == "idle"
         self.btn_start.enable(idle)
         self.btn_start.set_text("Start session" if idle else "Session in progress")
-        show_break = mine and app.phase == "break"
-        if show_break and not self._break_btns:
-            self.btn_skip.pack(fill="x", pady=(8, 0))
-            self.btn_end.pack(fill="x", pady=(8, 0))
-            self._break_btns = True
-        elif not show_break and self._break_btns:
-            self.btn_skip.pack_forget()
-            self.btn_end.pack_forget()
-            self._break_btns = False
+        self._layout_buttons(key)
 
 
 class StopwatchView(tk.Frame):
@@ -879,7 +1193,7 @@ class StopwatchView(tk.Frame):
             return
         self.laps.append(e)
         prev = self.laps[-2] if len(self.laps) > 1 else 0
-        self.lb.insert(0, f"Lap {len(self.laps):<3} {self.fmt(e)}     +{self.fmt(e - prev)}")
+        self.lb.insert(0, f"  Lap {len(self.laps):<3} {self.fmt(e)}     +{self.fmt(e - prev)}")
 
     def reset(self):
         self.running = False
@@ -1010,6 +1324,9 @@ class ProgressView(tk.Frame):
 
 
 # ----------------------------------------------------------------- application
+LOCK_ATTRS = ("l_ring", "l_msg", "l_entry", "l_lb", "l_count", "l_play", "l_vol", "lv_doubt", "viewer")
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -1017,7 +1334,7 @@ class App:
         self.audio = Audio()
         self.blocker = KeyBlocker()
 
-        self.phase = "idle"       # idle | study | break
+        self.phase = "idle"       # idle | study | break | paused
         self.mode = "self"        # self | lecture
         self.cycle = 0
         self.cycles = 1
@@ -1026,11 +1343,15 @@ class App:
         self.phase_total = 1
         self.phase_end = 0.0
         self.end_msg = ""
+        self.resume_phase = "study"
+        self.paused_rem = 0.0
+        self.paused_at = 0.0
         self.last_tick = time.time()
         self.last_save = time.time()
         self.lock = None
 
         # lecture
+        self.q_cmds = queue.Queue()
         self.q_doubts = queue.Queue()
         self.server = None
         self.player = None
@@ -1042,8 +1363,8 @@ class App:
         self.lecture_pos = 0.0
 
         root.title(APP_NAME)
-        root.geometry("1040x720")
-        root.minsize(960, 660)
+        root.geometry("1060x740")
+        root.minsize(980, 680)
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1055,6 +1376,7 @@ class App:
             self.views["self"].audio_name.set(os.path.basename(s["audio"]))
 
         self.refresh_doubts()
+        self.refresh_pdf_list()
         self.refresh_progress()
         self.views["lecture"].update_lec_label()
         dark_titlebar(root)
@@ -1076,10 +1398,10 @@ class App:
                            ("stopwatch", "Stopwatch"), ("progress", "Progress")):
             self._nav_item(side, key, label)
 
-        box = tk.Frame(side, bg=SURFACE, highlightthickness=1, highlightbackground=BORDER)
+        box = tk.Frame(side, bg=BORDER)
         box.pack(side="bottom", fill="x", padx=14, pady=16)
         inner = tk.Frame(box, bg=SURFACE, padx=14, pady=12)
-        inner.pack(fill="x")
+        inner.pack(fill="x", padx=1, pady=1)
         tk.Label(inner, text="TODAY", bg=SURFACE, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w")
         self.side_today = tk.Label(inner, text="0h 00m", bg=SURFACE, fg=TEXT, font=(FONT, 15, "bold"))
         self.side_today.pack(anchor="w")
@@ -1088,7 +1410,7 @@ class App:
         self.side_streak.pack(anchor="w")
 
         self.content = tk.Frame(self.root, bg=BG)
-        self.content.pack(side="left", fill="both", expand=True, padx=30, pady=26)
+        self.content.pack(side="left", fill="both", expand=True, padx=30, pady=24)
         self.views = {"self": SessionView(self.content, self, "self"),
                       "lecture": SessionView(self.content, self, "lecture")}
         self.sw_view = StopwatchView(self.content, self)
@@ -1120,7 +1442,7 @@ class App:
             wdg.config(bg=c)
 
     def show_page(self, name):
-        for k, page in self.pages.items():
+        for page in self.pages.values():
             page.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
         self.current_page = name
@@ -1128,7 +1450,7 @@ class App:
             active = k == name
             row.config(bg=SURFACE if active else SIDEBAR)
             lab.config(bg=SURFACE if active else SIDEBAR, fg=TEXT if active else MUTED)
-            bar.config(bg=(ACC if k != "lecture" else VIOLET) if active else SIDEBAR)
+            bar.config(bg=(VIOLET if k == "lecture" else ACC) if active else SIDEBAR)
         if name == "progress":
             self.prog_view.refresh()
 
@@ -1209,6 +1531,38 @@ class App:
         if self.lock and hasattr(self, "l_play"):
             self.l_play.set_text(txt)
 
+    # ---------- PDFs
+    def pdf_paths(self):
+        return [p for p in self.data["settings"]["self"]["pdfs"] if os.path.exists(p)]
+
+    def add_pdfs(self):
+        paths = filedialog.askopenfilenames(title="Choose PDF files", filetypes=[("PDF files", "*.pdf")])
+        if not paths:
+            return
+        lst = self.data["settings"]["self"]["pdfs"]
+        for p in paths:
+            p = os.path.normpath(p)
+            if p not in lst:
+                lst.append(p)
+        save_data(self.data)
+        self.refresh_pdf_list()
+
+    def remove_pdf(self, listbox):
+        sel = listbox.curselection()
+        if not sel:
+            messagebox.showinfo(APP_NAME, "Select a PDF in the list first.")
+            return
+        del self.data["settings"]["self"]["pdfs"][sel[0]]
+        save_data(self.data)
+        self.refresh_pdf_list()
+
+    def refresh_pdf_list(self):
+        lb = self.views["self"].lb_pdf
+        lb.delete(0, "end")
+        for p in self.data["settings"]["self"]["pdfs"]:
+            flag = "" if os.path.exists(p) else "   (file not found)"
+            lb.insert("end", f"  {os.path.basename(p)}{flag}")
+
     # ---------- doubts
     def add_doubt(self, var):
         t = var.get().strip()
@@ -1235,7 +1589,7 @@ class App:
                 v.lb.insert("end", f"  {d['at']}    {d['t']}")
         if self.lock and hasattr(self, "l_lb"):
             self.l_lb.delete(0, "end")
-            for d in self.data["doubts"][-5:]:
+            for d in self.data["doubts"][-6:]:
                 self.l_lb.insert("end", f"  {d['at']}    {d['t']}")
             self.l_count.config(text=f"{len(self.data['doubts'])} doubt(s) saved")
 
@@ -1261,6 +1615,15 @@ class App:
             save_data(self.data)
             self.refresh_doubts()
 
+    def drain_cmds(self):
+        while True:
+            try:
+                c = self.q_cmds.get_nowait()
+            except queue.Empty:
+                break
+            if c == "prayer":
+                self.pause_session()
+
     # ---------- session control
     def start_session(self, mode):
         if self.phase != "idle":
@@ -1280,10 +1643,15 @@ class App:
             self.lecture_pos = self.lec_start
             self.lec_active = True
             extra = "A YouTube lecture will play full screen. You can pause, resume and seek.\n\n"
+        else:
+            n = len(self.pdf_paths())
+            if n:
+                extra = f"{n} PDF file(s) will open inside the locked study screen.\n\n"
         if not messagebox.askyesno(
                 "Start focus session",
                 f"Your screen will be locked for {study} minutes (strict mode: no exit before the timer ends).\n"
                 f"Then a {brk} minute break. {cyc} session(s) in total.\n\n{extra}"
+                "You can use the Prayer break button at any time: it pauses everything and unlocks the screen.\n"
                 "Emergency exit: Ctrl+Alt+Del or Ctrl+Shift+Esc, open Task Manager and end StudyLock.\n\n"
                 "Start now?"):
             self.lec_active = False
@@ -1299,39 +1667,74 @@ class App:
         self.end_msg = ""
         self.start_study()
 
-    def start_study(self):
-        self.phase = "study"
-        self.phase_total = self.study_min * 60
-        self.phase_end = time.time() + self.phase_total
+    def enter_study_screen(self):
         self.open_lock()
         if self.lec_active:
             self.audio.pause()
             self.sync_audio_buttons()
             self.player_fail = 0
             self.launch_player()
-        elif self.audio.loaded and not self.audio.playing:
+        elif self.mode == "self" and self.audio.loaded and not self.audio.playing:
             self.audio.start()
             self.sync_audio_buttons()
         self.root.withdraw()
+
+    def start_study(self):
+        self.phase = "study"
+        self.phase_total = self.study_min * 60
+        self.phase_end = time.time() + self.phase_total
+        self.enter_study_screen()
         self.beep()
 
-    def finish_study(self):
-        self.stop_player()
-        self.close_lock()
-        self.audio.pause()
-        self.sync_audio_buttons()
-        save_data(self.data)
-        self.phase = "break"
-        self.phase_total = self.break_min * 60
-        self.phase_end = time.time() + self.phase_total
+    def show_main(self):
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.root.after(1500, lambda: self.root.attributes("-topmost", False))
         self.show_page(self.mode)
+
+    def finish_study(self):
+        self.leave_study_screen()
+        save_data(self.data)
+        self.phase = "break"
+        self.phase_total = self.break_min * 60
+        self.phase_end = time.time() + self.phase_total
+        self.show_main()
         self.views["lecture"].update_lec_label()
         self.beep()
         self.refresh_progress()
+
+    def leave_study_screen(self):
+        self.stop_player()
+        self.close_lock()
+        self.audio.pause()
+        self.sync_audio_buttons()
+
+    def pause_session(self):
+        """Prayer break: freeze everything (timer, study counting, audio, video) and unlock the screen."""
+        if self.phase not in ("study", "break"):
+            return
+        now = time.time()
+        self.paused_rem = max(1.0, self.phase_end - now)
+        self.paused_at = now
+        self.resume_phase = self.phase
+        was = self.phase
+        self.phase = "paused"
+        if was == "study":
+            self.leave_study_screen()
+            self.show_main()
+        save_data(self.data)
+
+    def resume_session(self):
+        if self.phase != "paused":
+            return
+        now = time.time()
+        self.phase = self.resume_phase
+        self.phase_end = now + self.paused_rem
+        self.last_tick = now
+        if self.phase == "study":
+            self.enter_study_screen()
+        self.beep()
 
     def finish_break(self):
         if self.cycle < self.cycles:
@@ -1345,7 +1748,7 @@ class App:
             self.finish_break()
 
     def stop_session(self):
-        if self.phase == "break" and messagebox.askyesno(APP_NAME, "End the session now?"):
+        if self.phase in ("break", "paused") and messagebox.askyesno(APP_NAME, "End the session now?"):
             self.end_all("Session ended.")
 
     def end_all(self, msg):
@@ -1419,6 +1822,29 @@ class App:
         return self.player is not None
 
     # ---------- lock screen
+    def _prayer_btn(self, parent):
+        return Btn(parent, "Prayer break", lambda: self.root.after(30, self.pause_session), "warn")
+
+    def _lock_doubt_box(self, parent, accent, bg, entry_width, list_height, expand=False):
+        self.lv_doubt = tk.StringVar()
+        self.l_entry = tk.Entry(parent, textvariable=self.lv_doubt, width=entry_width, bg=SURFACE2 if bg == SURFACE else SURFACE,
+                                fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 12),
+                                highlightthickness=1, highlightbackground=BORDER, highlightcolor=accent)
+        self.l_entry.bind("<Return>", lambda e: self.add_doubt(self.lv_doubt))
+        return self.l_entry
+
+    def _lock_audio_row(self, parent, bg):
+        arow = tk.Frame(parent, bg=bg)
+        self.l_play = Btn(arow, "Play", self.toggle_audio, "secondary", size=9, padx=14, pady=6)
+        self.l_play.pack(side="left")
+        self.l_vol = tk.Scale(arow, from_=0, to=100, orient="horizontal", showvalue=False,
+                              bg=bg, troughcolor=SURFACE2, highlightthickness=0, bd=0,
+                              sliderrelief="flat", width=12, sliderlength=20, activebackground=ACC, length=150)
+        self.l_vol.set(self.audio.volume)
+        self.l_vol.config(command=self.on_volume)
+        self.l_vol.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        return arow
+
     def open_lock(self):
         w = tk.Toplevel(self.root)
         self.lock = w
@@ -1431,6 +1857,21 @@ class App:
             w.bind(seq, lambda e: "break")
         self.blocker.start()
 
+        paths = self.pdf_paths() if self.mode == "self" else []
+        if paths:
+            self._lock_layout_pdf(w, accent, paths)
+        else:
+            self._lock_layout_center(w, accent)
+
+        self.refresh_doubts()
+        self.sync_audio_buttons()
+        w.update_idletasks()
+        w.focus_force()
+        self.l_entry.focus_set()
+        if paths:
+            self.viewer.open(0)
+
+    def _lock_layout_center(self, w, accent):
         box = tk.Frame(w, bg=LOCK_BG)
         box.place(relx=0.5, rely=0.5, anchor="center")
         tk.Label(box, text="SELF STUDY" if self.mode == "self" else "LECTURE", bg=LOCK_BG, fg=accent,
@@ -1444,12 +1885,9 @@ class App:
 
         row = tk.Frame(box, bg=LOCK_BG)
         row.pack()
-        self.lv_doubt = tk.StringVar()
-        self.l_entry = tk.Entry(row, textvariable=self.lv_doubt, width=46, bg=SURFACE, fg=TEXT,
-                                insertbackground=TEXT, relief="flat", font=(FONT, 13),
-                                highlightthickness=1, highlightbackground=BORDER, highlightcolor=accent)
+        self._lock_doubt_box(row, accent, LOCK_BG, 46, 4)
+        self.l_entry.config(font=(FONT, 13))
         self.l_entry.pack(side="left", ipady=8, padx=(0, 8))
-        self.l_entry.bind("<Return>", lambda e: self.add_doubt(self.lv_doubt))
         Btn(row, "Save doubt", lambda: self.add_doubt(self.lv_doubt),
             "primary" if self.mode == "self" else "violet", size=11, pady=9).pack(side="left")
         self.l_count = tk.Label(box, bg=LOCK_BG, fg=MUTED, font=(FONT, 10))
@@ -1458,36 +1896,63 @@ class App:
         self.l_lb.config(width=66, bg=SURFACE)
         self.l_lb.pack()
 
+        bottom = tk.Frame(box, bg=LOCK_BG)
+        bottom.pack(pady=(20, 0))
         if self.mode == "self":
-            arow = tk.Frame(box, bg=LOCK_BG)
-            arow.pack(pady=(20, 0))
-            self.l_play = Btn(arow, "Play", self.toggle_audio, "secondary")
-            self.l_play.pack(side="left")
+            arow = self._lock_audio_row(bottom, LOCK_BG)
+            arow.pack(side="left", padx=(0, 20))
             name = os.path.basename(self.audio.path) if self.audio.loaded else "No audio selected"
-            tk.Label(arow, text=name, bg=LOCK_BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=14)
-            self.l_vol = tk.Scale(arow, from_=0, to=100, orient="horizontal", length=170, showvalue=False,
-                                  bg=LOCK_BG, troughcolor=SURFACE2, highlightthickness=0, bd=0,
-                                  sliderrelief="flat", width=12, sliderlength=20, activebackground=ACC)
-            self.l_vol.set(self.audio.volume)
-            self.l_vol.config(command=self.on_volume)
-            self.l_vol.pack(side="left")
+            tk.Label(bottom, text=name, bg=LOCK_BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=(0, 20))
         else:
-            Btn(box, "Retry lecture player", self.retry_player, "secondary").pack(pady=(18, 0))
+            Btn(bottom, "Retry lecture player", self.retry_player, "secondary").pack(side="left", padx=(0, 12))
+        self._prayer_btn(bottom).pack(side="left")
 
-        self.refresh_doubts()
-        self.sync_audio_buttons()
-        w.update_idletasks()
-        w.focus_force()
-        self.l_entry.focus_set()
+    def _lock_layout_pdf(self, w, accent, paths):
+        main = tk.Frame(w, bg=LOCK_BG)
+        main.pack(fill="both", expand=True, padx=14, pady=14)
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
+        self.viewer = PdfViewer(main, self, paths, accent)
+        self.viewer.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+
+        outer = tk.Frame(main, bg=BORDER, width=340)
+        outer.grid(row=0, column=1, sticky="ns")
+        outer.pack_propagate(False)
+        side = tk.Frame(outer, bg=SURFACE, padx=16, pady=16)
+        side.pack(fill="both", expand=True, padx=1, pady=1)
+
+        tk.Label(side, text="SELF STUDY", bg=SURFACE, fg=accent, font=(FONT, 11, "bold")).pack(pady=(0, 8))
+        self.l_ring = Ring(side, size=190, thick=11, bg=SURFACE, color=accent)
+        self.l_ring.pack()
+
+        self._prayer_btn(side).pack(side="bottom", fill="x")
+        arow = self._lock_audio_row(side, SURFACE)
+        arow.pack(side="bottom", fill="x", pady=(0, 12))
+        tk.Label(side, text="DOUBTS", bg=SURFACE, fg=MUTED, font=(FONT, 9, "bold")).pack(anchor="w", pady=(18, 6))
+        self._lock_doubt_box(side, accent, SURFACE, 10, 6)
+        self.l_entry.pack(fill="x", ipady=7)
+        Btn(side, "Save doubt", lambda: self.add_doubt(self.lv_doubt), "primary", size=10, pady=7).pack(fill="x", pady=(8, 6))
+        self.l_count = tk.Label(side, bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w")
+        self.l_count.pack(anchor="w")
+        self.l_lb = make_listbox(side, height=6)
+        self.l_lb.pack(fill="both", expand=True, pady=(6, 12))
 
     def close_lock(self):
         self.blocker.stop()
+        viewer = self.__dict__.get("viewer")
+        if viewer is not None:
+            try:
+                viewer.close()
+            except Exception:
+                pass
         if self.lock:
             try:
                 self.lock.destroy()
             except Exception:
                 pass
         self.lock = None
+        for a in LOCK_ATTRS:
+            self.__dict__.pop(a, None)
 
     # ---------- main loop
     def tick(self):
@@ -1497,6 +1962,7 @@ class App:
         if d > 2:          # laptop slept / app hung: do not count that time as study
             d = 0
         self.drain_doubts()
+        self.drain_cmds()
 
         if self.phase == "study":
             self.add_study(d)
@@ -1531,7 +1997,7 @@ class App:
     def on_close(self):
         if self.phase == "study":
             return
-        if self.phase == "break" and not messagebox.askyesno(APP_NAME, "A break is running. Quit anyway?"):
+        if self.phase in ("break", "paused") and not messagebox.askyesno(APP_NAME, "A session is running. Quit anyway?"):
             return
         self.stop_player()
         self.blocker.stop()

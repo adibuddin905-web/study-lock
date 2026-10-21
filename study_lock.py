@@ -6,17 +6,21 @@ STUDY LOCK  -  Windows study app
 * Customizable study / break / cycles
 * Stopwatch, daily hours, streak, 14-day chart
 * Study audio (PC se file chuno) - sirf is app se play hota hai, lock ke andar bhi
+* Lecture mode: YouTube lecture lock ke andar chalta hai - PAUSE nahi hota, sirf aage/peeche
 
 Sirf Python 3.9+ (Windows) chahiye. Koi pip install nahi.
 Run:  pythonw study_lock.py   (ya double-click run_study_app.bat)
 """
-import sys, os, json, time, ctypes
+import sys, os, json, time, ctypes, re, queue, secrets, threading, subprocess
+import http.server
+import urllib.parse
 import datetime as dt
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 IS_WIN = sys.platform.startswith("win")
 DATA_FILE = os.path.join(os.path.expanduser("~"), ".study_lock_data.json")
+PLAYER_LOG = os.path.join(os.path.expanduser("~"), ".study_lock_player.log")
 STREAK_MIN_MINUTES = 30          # itni study kare to din "streak" me ginega
 
 BG, CARD, FG, MUTED = "#12141c", "#1c2030", "#e8eaf2", "#8a90a8"
@@ -45,7 +49,8 @@ DEFAULTS = {
     "days": {},
     "doubts": [],
     "settings": {"study": 50, "break": 10, "cycles": 4,
-                 "audio": "", "volume": 70, "goal": 4},
+                 "audio": "", "volume": 70, "goal": 4,
+                 "lecture_on": False, "lecture_url": "", "lecture_pos": {}},
 }
 
 def load_data():
@@ -58,7 +63,7 @@ def load_data():
         if k not in d:
             d[k] = json.loads(json.dumps(v))
     for k, v in DEFAULTS["settings"].items():
-        d["settings"].setdefault(k, v)
+        d["settings"].setdefault(k, json.loads(json.dumps(v)))
     return d
 
 def save_data(d):
@@ -197,6 +202,195 @@ class KeyBlocker:
         self.hook = None
 
 
+# ----------------------------------------------------------------- lecture (YouTube) support
+def vt(sec):
+    sec = max(0, int(sec))
+    h, m, x = sec // 3600, sec % 3600 // 60, sec % 60
+    return f"{h}:{m:02d}:{x:02d}" if h else f"{m}:{x:02d}"
+
+
+def parse_youtube(url):
+    """-> (video_id, start_seconds) ya (None, 0)"""
+    url = (url or "").strip()
+    m = re.search(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:[^#]*&)?v=|embed/|shorts/|live/|v/))"
+                  r"([A-Za-z0-9_-]{11})", url)
+    if m:
+        vid = m.group(1)
+    elif re.fullmatch(r"[A-Za-z0-9_-]{11}", url):
+        vid = url
+    else:
+        return None, 0
+    start = 0
+    mt = re.search(r"[?&#](?:t|start)=([0-9hms]+)", url)
+    if mt:
+        v = mt.group(1)
+        if v.isdigit():
+            start = int(v)
+        else:
+            for n, u in re.findall(r"(\d+)([hms])", v):
+                start += int(n) * {"h": 3600, "m": 60, "s": 1}[u]
+    return vid, start
+
+
+PLAYER_HTML = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Lecture</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#0b0d14;color:#e8eaf2;font-family:"Segoe UI",sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none}
+body{display:flex;flex-direction:column}
+#top{flex:0 0 64px;display:flex;align-items:center;justify-content:space-between;padding:0 28px;background:#12141c}
+#phase{font-size:18px;color:#8a90a8}
+#timer{font-size:40px;font-weight:700;letter-spacing:1px}
+#stage{flex:1;position:relative;background:#000;min-height:0}
+#yt{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
+#shield{position:absolute;top:0;left:0;right:0;bottom:0;z-index:5;display:flex;align-items:center;justify-content:center;text-align:center;font-size:22px}
+#msg{display:none;background:rgba(11,13,20,.93);padding:28px 36px;border-radius:14px;max-width:70%;line-height:1.6}
+button{font-family:inherit;border:0;border-radius:10px;background:#1c2030;color:#e8eaf2;font-size:16px;font-weight:600;padding:12px 18px;cursor:pointer}
+button:hover{background:#2a3050}
+button.acc{background:#6c8cff;color:#fff}
+#ctl{flex:0 0 auto;display:flex;gap:10px;align-items:center;justify-content:center;padding:10px;background:#12141c}
+#pos{min-width:160px;text-align:center;color:#8a90a8}
+#dbt{flex:0 0 auto;display:flex;gap:10px;align-items:center;padding:10px 28px 14px;background:#12141c}
+#inp{flex:1;background:#1c2030;border:0;border-radius:10px;color:#e8eaf2;font-size:16px;padding:12px 14px;font-family:inherit;user-select:text;-webkit-user-select:text;outline:none}
+#cnt{color:#8a90a8;min-width:140px;text-align:right}
+</style></head><body>
+<div id="top"><div id="phase">Lecture</div><div id="timer">--:--</div></div>
+<div id="stage"><div id="yt"></div><div id="shield"><div id="msg"></div></div></div>
+<div id="ctl">
+<button onclick="seek(-30)">-30s</button><button onclick="seek(-10)">-10s</button>
+<span id="pos">0:00 / 0:00</span>
+<button onclick="seek(10)">+10s</button><button onclick="seek(30)">+30s</button>
+<button id="spd" onclick="cycleSpeed()">1x</button>
+</div>
+<div id="dbt"><input id="inp" placeholder="Doubt likho (video ka time apne aap jud jayega) - Enter dabao" autocomplete="off">
+<button class="acc" onclick="saveDoubt()">Doubt save</button><span id="cnt"></span></div>
+<script>
+var K=new URLSearchParams(location.search).get('k');
+var S=null,player=null,ready=false,started=false,ended=false,lastSave=0,count=0;
+var SPEEDS=[1,1.25,1.5,1.75,2],si=0;
+function $(id){return document.getElementById(id);}
+function pad(n){return String(n).padStart(2,'0');}
+function fmt(s){s=Math.max(0,Math.floor(s||0));var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?(h+':'+pad(m)+':'+pad(x)):(m+':'+pad(x));}
+function tm(r){r=Math.max(0,Math.ceil(r));return pad(Math.floor(r/60))+':'+pad(r%60);}
+function api(path,body){return fetch(path+'?k='+encodeURIComponent(K),{method:body?'POST':'GET',body:body?JSON.stringify(body):undefined}).then(function(r){return r.json();});}
+function showMsg(h){var m=$('msg');m.innerHTML=h;m.style.display='block';}
+function hideMsg(){$('msg').style.display='none';}
+function begin(){hideMsg();try{player.playVideo();}catch(e){}}
+function seek(d){if(!ready)return;var t=player.getCurrentTime()+d,dur=player.getDuration();
+ t=Math.max(0,dur>5?Math.min(t,dur-2):t);player.seekTo(t,true);if(started&&!ended)player.playVideo();}
+function cycleSpeed(){si=(si+1)%SPEEDS.length;if(ready)player.setPlaybackRate(SPEEDS[si]);$('spd').textContent=SPEEDS[si]+'x';}
+function saveDoubt(){var v=$('inp').value.trim();if(!v)return;var t=ready?player.getCurrentTime():0;
+ api('/doubt',{text:v,t:t}).then(function(){count++;$('cnt').textContent=count+' doubt saved';$('inp').value='';});}
+$('inp').addEventListener('keydown',function(e){if(e.key==='Enter'){saveDoubt();}});
+document.addEventListener('keydown',function(e){
+ var inp=e.target&&e.target.id==='inp';
+ if(!inp){if(e.key==='ArrowLeft')seek(-10);else if(e.key==='ArrowRight')seek(10);e.preventDefault();return;}
+ if(e.ctrlKey||e.altKey||/^F\d+$/.test(e.key))e.preventDefault();
+},true);
+document.addEventListener('contextmenu',function(e){e.preventDefault();});
+function onReady(){ready=true;player.playVideo();
+ setTimeout(function(){if(!started)showMsg('<button class="acc" onclick="begin()">&#9654; Lecture start karo</button>');},4000);}
+function onState(e){var st=e.data;
+ if(st===1){started=true;ended=false;hideMsg();}
+ else if(st===2&&started&&!ended){player.playVideo();}
+ else if(st===0){ended=true;showMsg('Video khatam ho gaya.<br>Timer chalne do, doubts likh lo.');}}
+function onError(e){showMsg('Ye video yahan chal nahi sakta (error '+e.data+').<br>Video owner embed allow nahi karta ya link galat hai.<br>Koi aur video ka link do.');}
+window.onYouTubeIframeAPIReady=function(){
+ player=new YT.Player('yt',{videoId:S.video_id,playerVars:{autoplay:1,controls:0,disablekb:1,fs:0,rel:0,modestbranding:1,playsinline:1,iv_load_policy:3,start:Math.floor(S.start||0)},
+  events:{onReady:onReady,onStateChange:onState,onError:onError}});};
+setInterval(function(){
+ if(!S)return;
+ $('timer').textContent=tm((S.phase_end-Date.now())/1000);
+ if(ready){var t=player.getCurrentTime(),d=player.getDuration();$('pos').textContent=fmt(t)+' / '+fmt(d);
+  if(Date.now()-lastSave>4000){lastSave=Date.now();api('/pos',{t:t});}}
+},500);
+api('/state').then(function(s){S=s;$('phase').textContent='Study '+S.cycle+'/'+S.cycles;$('cnt').textContent=S.doubts+' doubt(s)';
+ var sc=document.createElement('script');sc.src='https://www.youtube.com/iframe_api';
+ sc.onerror=function(){showMsg('YouTube load nahi hua. Internet check karo.');};document.head.appendChild(sc);});
+</script></body></html>
+"""
+
+
+class LectureServer:
+    """Chhota local server (sirf 127.0.0.1): player page deta hai, doubts/position leta hai."""
+
+    def __init__(self, app):
+        self.app = app
+        self.token = secrets.token_urlsafe(12)
+        srv = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _parse(self):
+                q = urllib.parse.urlparse(self.path)
+                ok = urllib.parse.parse_qs(q.query).get("k", [""])[0] == srv.token
+                return q.path, ok
+
+            def _send(self, code, body, ctype="application/json"):
+                b = body.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", ctype + "; charset=utf-8")
+                self.send_header("Content-Length", str(len(b)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                path, ok = self._parse()
+                if not ok:
+                    return self._send(403, "{}")
+                if path == "/":
+                    return self._send(200, PLAYER_HTML, "text/html")
+                if path == "/state":
+                    return self._send(200, json.dumps(srv.app.lecture_state()))
+                self._send(404, "{}")
+
+            def do_POST(self):
+                path, ok = self._parse()
+                if not ok:
+                    return self._send(403, "{}")
+                try:
+                    n = int(self.headers.get("Content-Length", 0) or 0)
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                except Exception:
+                    body = {}
+                try:
+                    if path == "/doubt":
+                        srv.app.q_doubts.put(body)
+                    elif path == "/pos":
+                        srv.app.lecture_pos = float(body.get("t", 0) or 0)
+                except Exception:
+                    pass
+                self._send(200, "{}")
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def url(self):
+        return f"http://127.0.0.1:{self.port}/?k={self.token}"
+
+
+def run_player(url):
+    """Alag process: fullscreen, always-on-top lecture window (Edge WebView2)."""
+    try:
+        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--autoplay-policy=no-user-gesture-required"
+        import webview
+        webview.create_window("Study Lecture", url, fullscreen=True, on_top=True,
+                              background_color="#0b0d14", easy_drag=False, text_select=False)
+        webview.start(gui="edgechromium" if IS_WIN else None)
+    except Exception:
+        import traceback
+        try:
+            with open(PLAYER_LOG, "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        sys.exit(1)
+
+
 # ----------------------------------------------------------------- app
 class App:
     def __init__(self, root):
@@ -214,6 +408,17 @@ class App:
         self.last_save = time.time()
         self.lock = None
 
+        # lecture
+        self.q_doubts = queue.Queue()
+        self.server = None
+        self.player = None
+        self.player_started = 0.0
+        self.player_fail = 0
+        self.lec_active = False
+        self.lec_vid = None
+        self.lec_start = 0.0
+        self.lecture_pos = 0.0
+
         # stopwatch
         self.sw_running = False
         self.sw_acc = 0.0
@@ -221,8 +426,8 @@ class App:
         self.laps = []
 
         root.title("Study Lock")
-        root.geometry("760x720")
-        root.minsize(700, 660)
+        root.geometry("760x730")
+        root.minsize(700, 640)
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -236,6 +441,7 @@ class App:
 
         self.refresh_doubts()
         self.refresh_progress()
+        self.update_lec_label()
         self.tick()
 
     # ---------- styling
@@ -263,6 +469,8 @@ class App:
         st.map("Acc.TButton", background=[("active", "#8aa3ff")])
         st.configure("Horizontal.TProgressbar", troughcolor=CARD, background=GOOD,
                      borderwidth=0, thickness=10)
+        st.configure("Card.TCheckbutton", background=CARD, foreground=FG)
+        st.map("Card.TCheckbutton", background=[("active", CARD)])
         st.configure("TSpinbox", fieldbackground=CARD, foreground=FG, background=CARD)
         st.configure("TScale", background=CARD, troughcolor=BG)
 
@@ -283,8 +491,8 @@ class App:
         self.build_progress()
 
     def card(self, parent, **kw):
-        f = ttk.Frame(parent, style="Card.TFrame", padding=14)
-        f.pack(fill="x", pady=6, **kw)
+        f = ttk.Frame(parent, style="Card.TFrame", padding=10)
+        f.pack(fill="x", pady=4, **kw)
         return f
 
     def build_session(self):
@@ -295,7 +503,7 @@ class App:
         c = self.card(p)
         self.lbl_phase = ttk.Label(c, text="Ready", style="Muted.TLabel", font=(FONT, 11))
         self.lbl_phase.pack()
-        self.lbl_big = ttk.Label(c, text="00:00", style="Card.TLabel", font=(FONT, 54, "bold"))
+        self.lbl_big = ttk.Label(c, text="00:00", style="Card.TLabel", font=(FONT, 44, "bold"))
         self.lbl_big.pack()
         self.pb = ttk.Progressbar(c, maximum=1000)
         self.pb.pack(fill="x", pady=(6, 0))
@@ -322,6 +530,22 @@ class App:
         self.btn_skip = ttk.Button(btns, text="Break skip -> next study", command=self.skip_break)
         self.btn_stop = ttk.Button(btns, text="Session band karo", command=self.stop_session)
 
+        # lecture
+        c = self.card(p)
+        self.v_lec_on = tk.BooleanVar(value=s["lecture_on"])
+        ttk.Checkbutton(c, text="Lecture mode: study time me YouTube lecture chalao (pause nahi hoga, sirf aage/peeche)",
+                        variable=self.v_lec_on, style="Card.TCheckbutton").pack(anchor="w")
+        row = ttk.Frame(c, style="Card.TFrame")
+        row.pack(fill="x", pady=(8, 0))
+        self.v_lec_url = tk.StringVar(value=s["lecture_url"])
+        le = tk.Entry(row, textvariable=self.v_lec_url, bg=BG, fg=FG, insertbackground=FG,
+                      relief="flat", font=(FONT, 11))
+        le.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 6))
+        le.bind("<FocusOut>", lambda ev: self.update_lec_label())
+        ttk.Button(row, text="Position reset", command=self.reset_lec_pos).pack(side="left")
+        self.lbl_lec = ttk.Label(c, text="", style="Muted.TLabel")
+        self.lbl_lec.pack(anchor="w", pady=(4, 0))
+
         # audio
         c = self.card(p)
         ttk.Label(c, text="Study audio", style="Card.TLabel",
@@ -343,7 +567,7 @@ class App:
         c.pack_configure(fill="both", expand=True)
         ttk.Label(c, text="Doubts (break me clear karne ke liye)", style="Card.TLabel",
                   font=(FONT, 10, "bold")).pack(anchor="w")
-        self.lb = tk.Listbox(c, height=6, bg=BG, fg=FG, bd=0, highlightthickness=0,
+        self.lb = tk.Listbox(c, height=4, bg=BG, fg=FG, bd=0, highlightthickness=0,
                              selectbackground=ACC, font=(FONT, 11), activestyle="none")
         self.lb.pack(fill="both", expand=True, pady=6)
         row = ttk.Frame(c, style="Card.TFrame")
@@ -612,13 +836,17 @@ class App:
         except Exception:
             messagebox.showerror("Settings", "Study 1-240, Break 1-60, Cycles 1-12 ke beech rakho.")
             return
+        if not self.prepare_lecture():
+            return
         if not messagebox.askyesno(
                 "Lock shuru?",
                 f"{study} min ke liye poora laptop lock ho jayega (strict mode, beech me exit nahi).\n"
-                f"Phir {brk} min break. Total {cyc} cycle.\n\nStart karein?"):
+                f"Phir {brk} min break. Total {cyc} cycle.\n"
+                f"{'Lecture mode ON: video pause nahi hoga.' if self.lec_active else ''}\n\nStart karein?"):
             return
         s = self.data["settings"]
-        s.update(study=study, **{"break": brk}, cycles=cyc)
+        s.update(study=study, **{"break": brk}, cycles=cyc,
+                 lecture_on=bool(self.v_lec_on.get()), lecture_url=self.v_lec_url.get().strip())
         save_data(self.data)
         self.cycles, self.cycle = cyc, 1
         self.start_study()
@@ -631,11 +859,18 @@ class App:
         self.btn_stop.pack_forget()
         self.btn_start.state(["disabled"])
         self.open_lock()
-        self.audio_start_for_study()
+        if self.lec_active:
+            self.audio.pause()
+            self.sync_audio_buttons()
+            self.player_fail = 0
+            self.launch_player()
+        else:
+            self.audio_start_for_study()
         self.root.withdraw()
         self.beep()
 
     def finish_study(self):
+        self.stop_player()
         self.close_lock()
         self.audio.pause()
         self.sync_audio_buttons()
@@ -651,6 +886,7 @@ class App:
         self.btn_stop.pack(side="left", padx=4)
         self.nb.select(self.tab_session)
         self.beep()
+        self.update_lec_label()
         self.refresh_progress()
 
     def finish_break(self):
@@ -687,6 +923,116 @@ class App:
         except Exception:
             self.root.bell()
 
+    # ---------- lecture
+    def update_lec_label(self):
+        vid, t0 = parse_youtube(self.v_lec_url.get())
+        if not self.v_lec_url.get().strip():
+            self.lbl_lec.config(text="YouTube video ka link yahan paste karo.")
+        elif not vid:
+            self.lbl_lec.config(text="Link samajh nahi aaya (ek video ka link do, playlist ka nahi).")
+        else:
+            saved = self.data["settings"]["lecture_pos"].get(vid)
+            pos = saved if saved is not None else t0
+            self.lbl_lec.config(text=f"Video OK  |  Yahan se resume hoga: {vt(pos)}")
+
+    def reset_lec_pos(self):
+        vid, _ = parse_youtube(self.v_lec_url.get())
+        if vid:
+            self.data["settings"]["lecture_pos"].pop(vid, None)
+            save_data(self.data)
+        self.update_lec_label()
+
+    def prepare_lecture(self):
+        self.lec_active = False
+        if not self.v_lec_on.get():
+            return True
+        vid, t0 = parse_youtube(self.v_lec_url.get())
+        if not vid:
+            messagebox.showerror("Lecture", "YouTube video ka sahi link daalo (ek video ka, playlist ka nahi).")
+            return False
+        saved = self.data["settings"]["lecture_pos"].get(vid)
+        self.lec_vid = vid
+        self.lec_start = float(saved if saved is not None else t0)
+        self.lecture_pos = self.lec_start
+        self.lec_active = True
+        return True
+
+    def lecture_state(self):          # server thread se bulaya jata hai
+        return {"video_id": self.lec_vid, "start": self.lec_start,
+                "phase_end": self.phase_end * 1000, "cycle": self.cycle,
+                "cycles": self.cycles, "doubts": len(self.data["doubts"])}
+
+    def launch_player(self):
+        if self.server is None:
+            self.server = LectureServer(self)
+        self.lec_start = self.lecture_pos
+        cmd = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            cmd.append(os.path.abspath(__file__))
+        cmd += ["--player", self.server.url()]
+        self.player_started = time.time()
+        try:
+            self.player = subprocess.Popen(cmd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except Exception as e:
+            print("player launch error", e)
+            self.player = None
+            self.player_fail += 1
+
+    def stop_player(self):
+        if self.player is not None:
+            try:
+                if self.player.poll() is None:
+                    self.player.terminate()
+            except Exception:
+                pass
+        self.player = None
+        if self.lec_active and self.lec_vid and self.lecture_pos > 0:
+            self.data["settings"]["lecture_pos"][self.lec_vid] = max(0, self.lecture_pos - 3)
+            save_data(self.data)
+
+    def retry_player(self):
+        self.player_fail = 0
+        self.player_started = 0
+        if self.lock and hasattr(self, "l_msg"):
+            self.l_msg.config(text="Lecture player khul raha hai... (2-5 sec)")
+
+    def lecture_tick(self, now):
+        """True = player screen par hai (Tk lock ko peeche rehna hai)."""
+        if self.player is not None and self.player.poll() is not None:
+            ran = now - self.player_started
+            self.player = None
+            self.player_fail = self.player_fail + 1 if ran < 10 else 0
+        if self.player is None:
+            if self.player_fail < 3:
+                if now - self.player_started > 2:
+                    self.launch_player()
+            elif self.lock:
+                self.l_msg.config(text="Lecture player start nahi hua (Edge WebView2?). Retry dabao. "
+                                       f"Log: {PLAYER_LOG}")
+        return self.player is not None
+
+    def drain_doubts(self):
+        changed = False
+        while True:
+            try:
+                b = self.q_doubts.get_nowait()
+            except queue.Empty:
+                break
+            text = str(b.get("text", "")).strip()
+            if not text:
+                continue
+            try:
+                t = float(b.get("t", 0) or 0)
+            except Exception:
+                t = 0
+            if t > 0:
+                text += f"   [video {vt(t)}]"
+            self.data["doubts"].append({"t": text, "at": dt.datetime.now().strftime("%H:%M")})
+            changed = True
+        if changed:
+            save_data(self.data)
+            self.refresh_doubts()
+
     # ---------- lock window
     def open_lock(self):
         w = tk.Toplevel(self.root)
@@ -708,6 +1054,10 @@ class App:
         self.l_msg = tk.Label(box, bg="#0b0d14", fg=MUTED, font=(FONT, 16),
                               text="Focus. Doubts neeche likh lo - break me clear karna.")
         self.l_msg.pack(pady=(0, 24))
+        if self.lec_active:
+            self.l_msg.config(text="Lecture player khul raha hai... (2-5 sec). Na khule to Retry dabao.")
+            tk.Button(box, text="Lecture dobara kholo (Retry)", bg=CARD, fg=FG, relief="flat",
+                      font=(FONT, 11, "bold"), command=self.retry_player).pack(pady=(0, 14))
 
         row = tk.Frame(box, bg="#0b0d14")
         row.pack(pady=6)
@@ -768,6 +1118,7 @@ class App:
         self.last_tick = now
         if d > 2:          # laptop sleep / hang: us time ko study me mat gino
             d = 0
+        self.drain_doubts()
 
         if self.phase == "study":
             self.add_study(d)
@@ -777,14 +1128,16 @@ class App:
             self.lbl_phase.config(text=label, foreground=ACC)
             self.lbl_big.config(text=ms(rem))
             self.pb["value"] = max(0, min(1000, elapsed / self.phase_total * 1000))
+            owns = self.lecture_tick(now) if self.lec_active else False
             if self.lock:
                 self.l_phase.config(text=f"STUDY  {self.cycle}/{self.cycles}")
                 self.l_time.config(text=ms(rem))
-                self.lock.lift()
-                self.lock.attributes("-topmost", True)
-                if self.lock.focus_displayof() is None:
-                    self.lock.focus_force()
-                    self.l_entry.focus_set()
+                if not owns:   # lecture player screen par ho to usse upar mat aao
+                    self.lock.lift()
+                    self.lock.attributes("-topmost", True)
+                    if self.lock.focus_displayof() is None:
+                        self.lock.focus_force()
+                        self.l_entry.focus_set()
             if rem <= 0:
                 self.finish_study()
             if now - self.last_save > 20:
@@ -815,6 +1168,7 @@ class App:
             return
         if self.phase == "break" and not messagebox.askyesno("Exit", "Break chal raha hai. Band karein?"):
             return
+        self.stop_player()
         self.blocker.stop()
         self.audio.close()
         save_data(self.data)
@@ -822,6 +1176,14 @@ class App:
 
 
 def main():
+    if "--player" in sys.argv:
+        if IS_WIN:
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
+        run_player(sys.argv[sys.argv.index("--player") + 1])
+        return
     if IS_WIN:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)

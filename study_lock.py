@@ -7,15 +7,18 @@ Two separate modes:
   * Lecture    : full-screen lock with a YouTube lecture (pause / resume / seek) and an optional PDF
                  beside it (split screen, adjustable)
 Prayer break pauses everything (timer, video, audio); the screen stays locked.
+Video speed 0.5x-3x with configurable shortcuts. The sidebar 'Update' button updates the exe in place.
 Plus stopwatch, daily hours, streaks and a 14-day chart.
 
 Needs Python 3.9+ (Windows). The study room uses 'pywebview' (Edge WebView2) and 'pymupdf'
 (PDF engine); the GitHub build installs both for you.
 Run:  pythonw study_lock.py
 """
-import sys, os, json, time, ctypes, re, queue, secrets, threading, subprocess
+import sys, os, json, time, ctypes, re, queue, secrets, threading, subprocess, collections
 import http.server
 import urllib.parse
+import urllib.request
+from collections import OrderedDict
 import datetime as dt
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -25,6 +28,13 @@ IS_WIN = sys.platform.startswith("win")
 APP_NAME = "StudyLock"
 DATA_FILE = os.path.join(os.path.expanduser("~"), ".study_lock_data.json")
 PLAYER_LOG = os.path.join(os.path.expanduser("~"), ".study_lock_player.log")
+GITHUB_REPO = "adibuddin905-web/study-lock"
+UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/tags/latest"
+MIN_EXE_BYTES = 5_000_000
+try:
+    from build_id import BUILD_ID          # written by the GitHub build
+except Exception:
+    BUILD_ID = "dev"
 STREAK_MIN_MINUTES = 30          # a day counts for the streak after this much study
 
 # ----------------------------------------------------------------- theme
@@ -72,10 +82,11 @@ def today_key():
 def default_settings():
     return {
         "goal": 4,
+        "keys": {},
         "self": {"study": 50, "break": 10, "cycles": 4, "audio": "", "volume": 70,
                  "pdfs": [], "pdf_state": {}, "pdf_night": True},
         "lecture": {"study": 50, "break": 10, "cycles": 2, "url": "", "pos": {},
-                    "pdfs": [], "split": 55, "swap": False},
+                    "pdfs": [], "split": 55, "swap": False, "speed": 1.0},
     }
 
 def load_data():
@@ -95,6 +106,8 @@ def load_data():
     old = dict(st)                               # settings from the first versions of the app
     new = default_settings()
     new["goal"] = old.get("goal", 4)
+    if isinstance(old.get("keys"), dict):
+        new["keys"] = old["keys"]
     for k in ("study", "break", "cycles"):
         if k in old:
             new["self"][k] = old[k]
@@ -306,31 +319,36 @@ body.lec{--accent:var(--vio)}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI",system-ui,sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none}
 #app{display:flex;flex-direction:column;height:100%}
-button{font-family:inherit}
+button,select,input,textarea{font-family:inherit}
 ::-webkit-scrollbar{width:12px;height:12px}::-webkit-scrollbar-thumb{background:#3a414b;border-radius:8px;border:3px solid transparent;background-clip:content-box}::-webkit-scrollbar-track{background:transparent}
 /* ---- top bar ---- */
-#bar{flex:0 0 54px;display:flex;align-items:center;gap:14px;padding:0 14px;background:var(--sur);border-bottom:1px solid var(--line);position:relative;z-index:50}
+#bar{flex:0 0 54px;display:flex;align-items:center;gap:10px;padding:0 12px;background:var(--sur);border-bottom:1px solid var(--line);position:relative;z-index:50}
 #prog{position:absolute;left:0;bottom:-1px;height:3px;width:0;background:var(--accent)}
-.brand{font-weight:700;font-size:15px;letter-spacing:.2px}
+.brand{font-weight:700;font-size:15px}
 .chip{font-size:11px;font-weight:700;color:var(--accent);background:rgba(140,140,255,.13);padding:5px 10px;border-radius:999px;white-space:nowrap}
 #timer{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums;min-width:74px}
 .sp{flex:1}
 .seg{display:flex;background:var(--sur2);border-radius:10px;padding:3px;gap:2px}
-.seg button{border:0;background:transparent;color:var(--mut);font-size:12px;font-weight:700;padding:6px 12px;border-radius:8px;cursor:pointer}
+.seg button{border:0;background:transparent;color:var(--mut);font-size:12px;font-weight:700;padding:6px 11px;border-radius:8px;cursor:pointer}
 .seg button.on{background:var(--accent);color:#fff}
-.b{border:0;border-radius:9px;background:var(--sur2);color:var(--text);font-size:13px;font-weight:600;padding:8px 14px;cursor:pointer;white-space:nowrap}
+.b{border:0;border-radius:9px;background:var(--sur2);color:var(--text);font-size:13px;font-weight:600;padding:8px 13px;cursor:pointer;white-space:nowrap}
 .b:hover{filter:brightness(1.25)}
 .b.acc{background:var(--accent);color:#fff}
 .b.warn{background:#3b2a08;color:var(--warn)}
 .b.good{background:#10361c;color:var(--good)}
+#speedbox{display:none;align-items:center;gap:4px;background:var(--sur2);border-radius:10px;padding:3px}
+#speedbox button{border:0;background:transparent;color:var(--text);font-size:14px;font-weight:700;width:28px;height:28px;border-radius:7px;cursor:pointer}
+#speedbox button:hover{background:#30363d}
+#speedbox #srs{width:auto;padding:0 8px;font-size:12px;color:var(--mut)}
+#spv{min-width:46px;text-align:center;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
 /* ---- panes ---- */
 #main{flex:1;display:flex;min-height:0;position:relative}
 .pane{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
-#split{flex:0 0 8px;cursor:col-resize;background:var(--line);position:relative}
-#split::after{content:"";position:absolute;left:2px;top:50%;width:4px;height:36px;margin-top:-18px;border-radius:3px;background:#5a6270}
-#split:hover,#split.drag{background:var(--accent)}
+.vsplit{flex:0 0 8px;cursor:col-resize;background:var(--line);position:relative}
+.vsplit::after{content:"";position:absolute;left:2px;top:50%;width:4px;height:36px;margin-top:-18px;border-radius:3px;background:#5a6270}
+.vsplit:hover,.vsplit.drag{background:var(--accent)}
 #dragcover{display:none;position:fixed;left:0;top:0;right:0;bottom:0;z-index:200;cursor:col-resize}
-/* ---- video pane ---- */
+/* ---- video ---- */
 #pv{background:#000}
 #yt{position:absolute;top:0;left:0;width:100%;height:100%;border:0}
 #shield{position:absolute;top:0;left:0;right:0;bottom:0;z-index:5;cursor:pointer}
@@ -344,47 +362,59 @@ button{font-family:inherit}
 #vrow .b{background:rgba(48,54,61,.85);padding:7px 12px;font-size:12px}
 #vrow .b.acc{background:var(--accent)}
 .msg{display:none;position:absolute;z-index:40;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(22,27,34,.97);border:1px solid var(--line);padding:22px 28px;border-radius:14px;max-width:80%;line-height:1.6;font-size:16px;text-align:center}
-/* ---- pdf pane ---- */
-#pp{background:var(--bg)}
-#ptools{flex:0 0 auto;background:var(--sur);border-bottom:1px solid var(--line);padding:8px 10px;display:flex;flex-direction:column;gap:8px}
-#tabs{display:flex;gap:6px;flex-wrap:wrap}
-.tab{border:0;border-radius:8px;background:var(--sur2);color:var(--text);font-size:12px;font-weight:600;padding:6px 11px;cursor:pointer;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tab.on{background:var(--accent);color:#fff}
-.trow{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.tool{border:0;background:var(--sur2);color:var(--text);font-size:12px;font-weight:700;padding:7px 11px;border-radius:8px;cursor:pointer}
+/* ---- pdf group ---- */
+#pdfgroup{display:none;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
+#ptools{flex:0 0 auto;background:var(--sur);border-bottom:1px solid var(--line);padding:8px 10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.tool{border:0;background:var(--sur2);color:var(--text);font-size:12px;font-weight:700;padding:7px 11px;border-radius:8px;cursor:pointer;white-space:nowrap}
+.tool:hover{filter:brightness(1.25)}
 .tool.on{background:var(--accent);color:#fff}
 .vsep{width:1px;height:22px;background:var(--line);margin:0 4px}
 #sw{display:flex;gap:6px;align-items:center}
 .dot{width:20px;height:20px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}
 .dot.on{border-color:#fff}
-#inkw{background:var(--sur2);color:var(--text);border:1px solid var(--line);border-radius:7px;font-size:12px;padding:4px}
-#pgi{width:46px;background:var(--sur2);color:var(--text);border:1px solid var(--line);border-radius:7px;text-align:center;font-size:12px;padding:5px;font-family:inherit;user-select:text;outline:none}
-#pgn,#zl{font-size:12px;color:var(--mut)}
-#saved{font-size:12px;font-weight:700;color:var(--good);min-width:78px;text-align:right}
-#ro{display:none;font-size:12px;font-weight:700;color:var(--warn)}
-#scroll{flex:1;overflow:auto;background:#1f2328;position:relative}
-#pages{display:flex;flex-direction:column;align-items:center;gap:12px;padding:14px 0}
+#thick{width:90px;accent-color:var(--accent)}
+#thv{font-size:12px;color:var(--mut);min-width:34px}
+#q{width:130px;background:var(--sur2);color:var(--text);border:1px solid var(--line);border-radius:8px;font-size:12px;padding:6px 8px;outline:none;user-select:text}
+#q:focus{border-color:var(--accent)}
+#qc{font-size:11px;color:var(--mut);min-width:40px}
+#saved{font-size:12px;font-weight:700;color:var(--good);min-width:70px;text-align:right}
+#prow{flex:1;display:flex;min-height:0;min-width:0}
+.pdfpane{background:var(--bg);flex:1 1 0}
+.phead{flex:0 0 auto;display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--sur);border-bottom:1px solid var(--line)}
+.dsel{background:var(--sur2);color:var(--text);border:1px solid var(--line);border-radius:7px;font-size:12px;padding:5px 6px;max-width:230px;min-width:0}
+.pgi{width:44px;background:var(--sur2);color:var(--text);border:1px solid var(--line);border-radius:7px;text-align:center;font-size:12px;padding:4px;outline:none;user-select:text}
+.pgn,.zl{font-size:12px;color:var(--mut)}
+.scroll{flex:1;overflow:auto;background:#1f2328;position:relative}
+.pages{display:flex;flex-direction:column;align-items:center;gap:12px;padding:14px 0}
 .page{position:relative;background:#fff;box-shadow:0 2px 14px rgba(0,0,0,.5);flex:0 0 auto}
 .page img{width:100%;height:100%;display:block;pointer-events:none;-webkit-user-drag:none}
-.ov{position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none;pointer-events:none}
-#pages.night .page{background:#111}
-#pages.night .page img{filter:invert(1) hue-rotate(180deg)}
-#pmsg{position:absolute;top:40px;left:0;right:0;text-align:center;color:var(--mut);font-size:14px;padding:0 20px}
-/* ---- drawer ---- */
-#drawer{display:none;position:absolute;right:12px;top:60px;width:340px;z-index:60;background:var(--sur);border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 12px 40px rgba(0,0,0,.55)}
+.page canvas{position:absolute;left:0;top:0;width:100%;height:100%}
+.page canvas.sr{pointer-events:none}
+.page canvas.ov{touch-action:none;pointer-events:none}
+.pages.night .page{background:#111}
+.pages.night .page img{filter:invert(1) hue-rotate(180deg)}
+.pmsg{position:absolute;top:40px;left:0;right:0;text-align:center;color:var(--mut);font-size:14px;padding:0 20px;display:none}
+.tbox{position:absolute;z-index:10;background:rgba(255,255,255,.88);border:1px dashed #4f8cff;color:#000;resize:none;outline:none;font-family:Helvetica,Arial,sans-serif;line-height:1.2;padding:2px;overflow:hidden;user-select:text;-webkit-user-select:text}
+/* ---- drawer / toast ---- */
+#drawer{display:none;position:absolute;right:12px;top:60px;width:350px;max-height:calc(100% - 80px);overflow:auto;z-index:60;background:var(--sur);border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 12px 40px rgba(0,0,0,.55)}
 .lbl{font-size:10px;font-weight:700;letter-spacing:1px;color:var(--mut);text-transform:uppercase;margin:0 0 8px}
-#inp{width:100%;background:var(--sur2);border:1px solid var(--line);border-radius:9px;color:var(--text);font-size:14px;padding:10px 12px;font-family:inherit;user-select:text;-webkit-user-select:text;outline:none}
+#inp{width:100%;background:var(--sur2);border:1px solid var(--line);border-radius:9px;color:var(--text);font-size:14px;padding:10px 12px;outline:none;user-select:text;-webkit-user-select:text}
 #inp:focus{border-color:var(--accent)}
-#dlist{list-style:none;margin:10px 0 0;padding:0;font-size:12px;max-height:200px;overflow:auto}
+#dlist{list-style:none;margin:10px 0 0;padding:0;font-size:12px;max-height:170px;overflow:auto}
 #dlist li{padding:6px 8px;background:var(--sur2);border-radius:7px;margin-bottom:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#aud{display:none;align-items:center;gap:10px;margin-top:14px}
+#aud{display:none;align-items:center;gap:10px;margin:0 0 14px}
 #vol{flex:1}
+.krow{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:12px}
+.keybtn{min-width:96px;border:1px solid var(--line);background:var(--sur2);color:var(--text);border-radius:8px;padding:6px 10px;font-size:12px;font-weight:700;cursor:pointer}
+.keybtn.cap{border-color:var(--accent);color:var(--accent)}
+#toast{display:none;position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:300;background:#1c2128;border:1px solid var(--line);color:var(--text);padding:10px 16px;border-radius:10px;font-size:13px;max-width:80%;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)}
 </style></head><body>
 <div id="app">
  <div id="bar">
   <span class="brand" id="brand">Study</span><span class="chip" id="phase">Session</span>
   <b id="timer">--:--</b>
   <div class="sp"></div>
+  <div id="speedbox"><button id="sdn" title="Slower">&minus;</button><span id="spv">1.0x</span><button id="sup" title="Faster">+</button><button id="srs" title="Reset speed">1x</button></div>
   <div class="seg" id="views" style="display:none"><button id="v-video" onclick="setView('video')">Video</button><button id="v-split" class="on" onclick="setView('split')">Split</button><button id="v-pdf" onclick="setView('pdf')">PDF</button></div>
   <button class="b" id="swapb" style="display:none" onclick="doSwap()">Swap sides</button>
   <button class="b" id="vpp" style="display:none" onclick="toggle()">Pause video</button>
@@ -399,42 +429,41 @@ button{font-family:inherit}
     <div id="seekrow"><span id="cur">0:00</span><div id="bar2"><div id="track"><div id="fill"></div></div></div><span id="dur">0:00</span></div>
     <div id="vrow"><button class="b" onclick="seek(-30)">&minus;30s</button><button class="b" onclick="seek(-10)">&minus;10s</button>
      <button class="b acc" id="pp2" onclick="toggle()">Pause</button>
-     <button class="b" onclick="seek(10)">+10s</button><button class="b" onclick="seek(30)">+30s</button><button class="b" id="spd" onclick="cycleSpeed()">1x</button></div>
+     <button class="b" onclick="seek(10)">+10s</button><button class="b" onclick="seek(30)">+30s</button></div>
    </div>
    <div class="msg" id="vmsg"></div>
   </div>
-  <div id="split" style="display:none"></div>
-  <div class="pane" id="pp" style="display:none">
+  <div class="vsplit" id="split" style="display:none"></div>
+  <div id="pdfgroup">
    <div id="ptools">
-    <div id="tabs"></div>
-    <div class="trow">
-     <button class="tool on" id="t-hand" onclick="setTool('hand')">Select</button>
-     <button class="tool" id="t-hl" onclick="setTool('hl')">Highlight</button>
-     <button class="tool" id="t-draw" onclick="setTool('draw')">Draw</button>
-     <button class="tool" id="t-erase" onclick="setTool('erase')">Eraser</button>
-     <span id="sw"></span>
-     <select id="inkw" style="display:none" onchange="inkW=parseFloat(this.value)"><option value="1.5">Thin</option><option value="3" selected>Medium</option><option value="6">Thick</option></select>
-     <span class="vsep"></span>
-     <button class="tool" onclick="undo()">Undo</button>
-     <button class="tool" onclick="zoomBy(1/1.15)">&minus;</button><span id="zl">Fit</span><button class="tool" onclick="zoomBy(1.15)">+</button><button class="tool" onclick="zoomFit()">Fit</button>
-     <button class="tool" id="nightb" onclick="toggleNight()">Night</button>
-     <input id="pgi" value="1"><span id="pgn">/ 1</span>
-     <span class="sp"></span>
-     <span id="ro">Read-only file: edits cannot be saved</span>
-     <span id="saved">Saved</span><button class="tool" onclick="savePdf()">Save</button>
-    </div>
+    <button class="tool on" id="t-hand" onclick="setTool('hand')">Select</button>
+    <button class="tool" id="t-hl" onclick="setTool('hl')">Highlighter</button>
+    <button class="tool" id="t-pen" onclick="setTool('pen')">Pen</button>
+    <button class="tool" id="t-text" onclick="setTool('text')">Text</button>
+    <button class="tool" id="t-erase" onclick="setTool('erase')">Eraser</button>
+    <span id="sw"></span>
+    <input type="range" id="thick" style="display:none"><span id="thv"></span>
+    <span class="vsep"></span>
+    <button class="tool" onclick="undo()">Undo</button>
+    <button class="tool" id="nightb" onclick="toggleNight()">Night</button>
+    <button class="tool" id="addpane" onclick="addPane()">+ PDF pane</button>
+    <span class="vsep"></span>
+    <input id="q" placeholder="Search (Ctrl+F)"><button class="tool" onclick="searchStep(-1)">&lsaquo;</button><button class="tool" onclick="searchStep(1)">&rsaquo;</button><span id="qc"></span>
+    <span class="sp"></span>
+    <span id="saved">Saved</span><button class="tool" onclick="savePdf()">Save</button>
    </div>
-   <div id="scroll"><div id="pages"></div><div id="pmsg"></div></div>
+   <div id="prow"></div>
   </div>
  </div>
  <div id="drawer">
+  <div id="aud"><button class="b" id="abtn" onclick="audioToggle()">Play audio</button><input id="vol" type="range" min="0" max="100" value="70" oninput="audioVol(this.value)"></div>
   <div class="lbl">Doubts</div>
   <input id="inp" placeholder="Write a doubt and press Enter" autocomplete="off">
   <ul id="dlist"></ul>
-  <div id="aud"><button class="b" id="abtn" onclick="audioToggle()">Play audio</button><input id="vol" type="range" min="0" max="100" value="70" oninput="audioVol(this.value)"></div>
+  <div id="keys" style="display:none;margin-top:14px"><div class="lbl">Video shortcuts (click, then press a key)</div><div id="klist"></div><button class="b" style="margin-top:6px" onclick="resetKeys()">Reset to defaults</button></div>
  </div>
 </div>
-<div id="dragcover"></div>
+<div id="dragcover"></div><div id="toast"></div>
 <script>
 var K=new URLSearchParams(location.search).get('k');
 function $(id){return document.getElementById(id);}
@@ -443,27 +472,33 @@ function fmt(s){s=Math.max(0,Math.floor(s||0));var h=Math.floor(s/3600),m=Math.f
 function tm(r){r=Math.max(0,Math.ceil(r));return pad(Math.floor(r/60))+':'+pad(r%60);}
 function U(path,qs){return path+'?k='+encodeURIComponent(K)+(qs?'&'+qs:'');}
 function api(path,body){return fetch(U(path),{method:body?'POST':'GET',body:body?JSON.stringify(body):undefined}).then(function(r){return r.json();});}
+function toast(t,ms){var e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(function(){e.style.display='none';},ms||4500);}
 var S=null,hasVideo=false,hasPdf=false,view='split',ratio=55,swap=false,hoverPane='',prayerPaused=false,dragVol=false;
 
 /* ================= layout ================= */
 function applyLayout(){
  var showV=hasVideo&&view!=='pdf',showP=hasPdf&&view!=='video',both=showV&&showP;
- var pv=$('pv'),pp=$('pp'),sp=$('split');
- pv.style.display=showV?'flex':'none';pp.style.display=showP?'flex':'none';sp.style.display=both?'block':'none';
- if(both){pv.style.flex='0 0 '+ratio+'%';pp.style.flex='1 1 0';}else{pv.style.flex='1 1 0';pp.style.flex='1 1 0';}
- pv.style.order=swap?3:1;sp.style.order=2;pp.style.order=swap?1:3;
+ var pv=$('pv'),pg=$('pdfgroup'),sp=$('split');
+ pv.style.display=showV?'flex':'none';pg.style.display=showP?'flex':'none';sp.style.display=both?'block':'none';
+ if(both){pv.style.flex='0 0 '+ratio+'%';pg.style.flex='1 1 0';}else{pv.style.flex='1 1 0';pg.style.flex='1 1 0';}
+ pv.style.order=swap?3:1;sp.style.order=2;pg.style.order=swap?1:3;
  ['video','split','pdf'].forEach(function(v){$('v-'+v).classList.toggle('on',v===view);});
 }
 function setView(v){view=v;applyLayout();}
 function doSwap(){swap=!swap;applyLayout();api('/layout',{split:ratio,swap:swap});}
-(function(){var sp=$('split'),cover=$('dragcover'),dragging=false;
- sp.addEventListener('mousedown',function(e){dragging=true;sp.classList.add('drag');cover.style.display='block';e.preventDefault();});
- window.addEventListener('mousemove',function(e){if(!dragging)return;var r=$('main').getBoundingClientRect();var x=(e.clientX-r.left)/r.width*100;ratio=swap?100-x:x;ratio=Math.max(20,Math.min(80,ratio));applyLayout();});
- window.addEventListener('mouseup',function(){if(!dragging)return;dragging=false;sp.classList.remove('drag');cover.style.display='none';api('/layout',{split:ratio,swap:swap});});
-})();
+function dragH(onMove,onEnd,cls){
+ var cover=$('dragcover');cover.style.display='block';
+ function mv(e){onMove(e);}
+ function up(){window.removeEventListener('mousemove',mv);window.removeEventListener('mouseup',up);cover.style.display='none';if(onEnd)onEnd();}
+ window.addEventListener('mousemove',mv);window.addEventListener('mouseup',up);
+}
+$('split').addEventListener('mousedown',function(e){
+ var sp=this;sp.classList.add('drag');e.preventDefault();
+ dragH(function(ev){var r=$('main').getBoundingClientRect();var x=(ev.clientX-r.left)/r.width*100;ratio=swap?100-x:x;ratio=Math.max(20,Math.min(80,ratio));applyLayout();},
+  function(){sp.classList.remove('drag');api('/layout',{split:ratio,swap:swap});});
+});
 function toggleDrawer(){var d=$('drawer');d.style.display=d.style.display==='block'?'none':'block';if(d.style.display==='block')$('inp').focus();}
 $('pv').addEventListener('mouseenter',function(){hoverPane='pv';});$('pv').addEventListener('mouseleave',function(){hoverPane='';});
-$('pp').addEventListener('mouseenter',function(){hoverPane='pp';});$('pp').addEventListener('mouseleave',function(){hoverPane='';});
 
 /* ================= doubts / audio / prayer ================= */
 function prayerToggle(){api(S&&S.phase==='paused'?'/resume':'/pause',{});}
@@ -474,9 +509,38 @@ $('inp').addEventListener('keydown',function(e){if(e.key==='Enter'){saveDoubt();
 $('vol').addEventListener('mousedown',function(){dragVol=true;});
 document.addEventListener('mouseup',function(){dragVol=false;});
 
+/* ================= shortcuts (configurable) ================= */
+var DEFAULT_KEYS={speedUp:']',speedDown:'[',speedReset:'\\',playPause:'K',seekBack:'J',seekFwd:'L'};
+var KEY_LABELS={speedUp:'Speed up (+0.1x)',speedDown:'Speed down (-0.1x)',speedReset:'Restore speed (1x)',playPause:'Play / pause video',seekBack:'Back 10 s',seekFwd:'Forward 10 s'};
+var keys={},keyAct={},capturing=null;
+function combo(e){
+ var k=e.key;if(k==='Control'||k==='Shift'||k==='Alt'||k==='Meta')return '';
+ if(k===' ')k='Space';else if(k.length===1)k=k.toUpperCase();
+ var p=[];if(e.ctrlKey)p.push('Ctrl');if(e.altKey)p.push('Alt');if(e.shiftKey&&k.length>1)p.push('Shift');
+ p.push(k);return p.join('+');
+}
+function rebuildKeyMap(){keyAct={};Object.keys(keys).forEach(function(a){if(keys[a])keyAct[keys[a]]=a;});}
+function buildKeyUI(){
+ var l=$('klist');l.innerHTML='';
+ Object.keys(KEY_LABELS).forEach(function(a){
+  var row=document.createElement('div');row.className='krow';
+  var s=document.createElement('span');s.textContent=KEY_LABELS[a];
+  var b=document.createElement('button');b.className='keybtn';b.textContent=keys[a]||'(none)';
+  b.onclick=function(){capturing=a;b.textContent='Press a key...';b.classList.add('cap');};
+  row.appendChild(s);row.appendChild(b);l.appendChild(row);});
+}
+function setKey(a,c){
+ Object.keys(keys).forEach(function(o){if(o!==a&&keys[o]===c&&c)keys[o]='';});
+ keys[a]=c;rebuildKeyMap();buildKeyUI();api('/keys',{keys:keys});
+}
+function resetKeys(){keys=JSON.parse(JSON.stringify(DEFAULT_KEYS));rebuildKeyMap();buildKeyUI();api('/keys',{keys:keys});}
+function runAction(a){
+ if(a==='speedUp')setSpeed(speed+0.1);else if(a==='speedDown')setSpeed(speed-0.1);else if(a==='speedReset')setSpeed(1);
+ else if(a==='playPause')toggle();else if(a==='seekBack')seek(-10);else if(a==='seekFwd')seek(10);
+}
+
 /* ================= video (YouTube IFrame API) ================= */
-var player=null,ready=false,started=false,ended=false,vpaused=false,lastSave=0,lastMove=Date.now(),vhover=false,wasPlaying=false;
-var SPEEDS=[1,1.25,1.5,1.75,2],si=0;
+var player=null,ready=false,started=false,ended=false,vpaused=false,lastSave=0,lastMove=Date.now(),vhover=false,wasPlaying=false,speed=1,speedDirect=false,warnedSpeed=false;
 function vshow(h){var m=$('vmsg');m.innerHTML=h;m.style.display='block';}
 function vhide(){$('vmsg').style.display='none';}
 function begin(){vhide();try{player.playVideo();}catch(e){}}
@@ -488,7 +552,23 @@ function toggle(){
 }
 function seek(d){if(!ready||prayerPaused)return;var t=player.getCurrentTime()+d,dur=player.getDuration();
  t=Math.max(0,dur>5?Math.min(t,dur-2):t);player.seekTo(t,true);}
-function cycleSpeed(){si=(si+1)%SPEEDS.length;if(ready)player.setPlaybackRate(SPEEDS[si]);$('spd').textContent=SPEEDS[si]+'x';}
+function videoEl(){try{return $('yt').contentDocument.querySelector('video');}catch(e){return null;}}
+function applyRate(){
+ if(!ready)return;
+ var v=videoEl();
+ if(v){speedDirect=true;if(Math.abs(v.playbackRate-speed)>0.001)v.playbackRate=speed;return;}
+ speedDirect=false;
+ var r=Math.min(2,speed);
+ try{if(Math.abs(player.getPlaybackRate()-r)>0.001)player.setPlaybackRate(r);}catch(e){}
+ if(speed>2&&!warnedSpeed){warnedSpeed=true;toast('Speeds above 2x are not available through the YouTube player on this system. Using 2x.',6000);}
+}
+function setSpeed(r,noSave){
+ r=Math.round(r*10)/10;r=Math.max(0.5,Math.min(3,r));speed=r;
+ $('spv').textContent=r.toFixed(1)+'x';applyRate();
+ if(!noSave)api('/speed',{v:r});
+}
+$('sdn').onclick=function(){setSpeed(speed-0.1);};$('sup').onclick=function(){setSpeed(speed+0.1);};$('srs').onclick=function(){setSpeed(1);};
+setInterval(applyRate,1000);
 $('bar2').addEventListener('click',function(e){
  if(!ready||prayerPaused)return;var r=this.getBoundingClientRect(),f=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));
  player.seekTo(f*player.getDuration(),true);});
@@ -499,10 +579,10 @@ setInterval(function(){
  var show=vpaused||prayerPaused||vhover||(Date.now()-lastMove<3000)||!started;
  $('hud').classList.toggle('hide',!show);
 },250);
-function onReady(){ready=true;player.playVideo();
+function onReady(){ready=true;player.playVideo();applyRate();
  setTimeout(function(){if(!started)vshow('<button class="b acc" style="font-size:15px;padding:12px 22px" onclick="begin()">&#9654; Start lecture</button>');},4000);}
 function onState(e){var st=e.data;
- if(st===1){started=true;ended=false;vpaused=false;vhide();$('pp2').textContent='Pause';$('vpp').textContent='Pause video';}
+ if(st===1){started=true;ended=false;vpaused=false;vhide();$('pp2').textContent='Pause';$('vpp').textContent='Pause video';applyRate();}
  else if(st===2){vpaused=started;$('pp2').textContent='Resume';$('vpp').textContent='Play video';}
  else if(st===0){ended=true;vpaused=true;$('pp2').textContent='Replay';vshow('Lecture finished.<br>The timer is still running - use the time for your doubts or notes.');}}
 function onError(e){vshow('This video cannot be played here (error '+e.data+').<br>The owner may have disabled embedding, or the link is wrong.<br>Try another video after this session.');}
@@ -519,8 +599,6 @@ setInterval(function(){
  $('cur').textContent=fmt(t);$('dur').textContent=fmt(d);$('fill').style.width=(d>0?Math.min(100,t/d*100):0)+'%';
  if(!prayerPaused&&Date.now()-lastSave>4000){lastSave=Date.now();api('/pos',{t:t});}
 },300);
-
-/* ================= prayer pause sync ================= */
 function syncPause(){
  var p=(S.phase==='paused');
  if(p&&!prayerPaused){prayerPaused=true;
@@ -531,204 +609,298 @@ function syncPause(){
   if(wasPlaying){try{player.playVideo();}catch(e){}}}
 }
 
-/* ================= PDF reader ================= */
-var docs=[],cur=-1,zoom=1,tool='hand',inkW=3,undoStack=[],wordsCache={},sel=null,stroke=null,raf=0,resizeT=0,pageEls=[],ver=[];
-var HL=[[1,0.88,0.1],[0.45,0.9,0.4],[1,0.55,0.75],[0.45,0.75,1]];
-var INK=[[0.93,0.18,0.18],[0.2,0.4,0.95],[0.05,0.05,0.05],[0.1,0.65,0.3]];
-var hlIdx=0,inkIdx=0;
+/* ================= PDF reader: tools ================= */
+var tool='hand',panes=[],activePane=null,undoStack=[],tb=null,nightOn=false;
+var PAL={hl:[[1,0.88,0.1],[0.45,0.9,0.4],[1,0.55,0.75],[0.45,0.75,1],[1,0.6,0.2]],
+         pen:[[0.93,0.18,0.18],[0.2,0.4,0.95],[0.05,0.05,0.05],[0.1,0.65,0.3]],
+         text:[[0,0,0],[0.85,0.1,0.1],[0.15,0.35,0.9],[0.1,0.55,0.25]]};
+var OPT={hl:{c:0,w:14,min:4,max:40,step:1,alpha:0.35},pen:{c:0,w:3,min:0.5,max:12,step:0.5},text:{c:0,w:14,min:8,max:48,step:1}};
 function rgb(c,a){return 'rgba('+Math.round(c[0]*255)+','+Math.round(c[1]*255)+','+Math.round(c[2]*255)+','+(a===undefined?1:a)+')';}
-function showPdfMsg(t){$('pmsg').textContent=t;$('pmsg').style.display='block';}
-function hidePdfMsg(){$('pmsg').style.display='none';}
+function setTool(t){
+ commitText();tool=t;
+ ['hand','hl','pen','text','erase'].forEach(function(x){$('t-'+x).classList.toggle('on',x===t);});
+ panes.forEach(applyToolTo);buildOptions();
+}
+function buildOptions(){
+ var sw=$('sw');sw.innerHTML='';var th=$('thick'),tv=$('thv');
+ if(!OPT[tool]){th.style.display='none';tv.textContent='';return;}
+ var o=OPT[tool];
+ PAL[tool].forEach(function(c,i){var b=document.createElement('button');b.className='dot'+(i===o.c?' on':'');b.style.background=rgb(c);b.onclick=function(){o.c=i;buildOptions();};sw.appendChild(b);});
+ th.style.display='';th.min=o.min;th.max=o.max;th.step=o.step;th.value=o.w;
+ tv.textContent=o.w+(tool==='text'?' pt':' pt');
+ th.oninput=function(){o.w=parseFloat(this.value);tv.textContent=o.w+' pt';};
+}
+function applyToolTo(P){P.pages.forEach(function(pg){var c=pg.ov;c.style.pointerEvents=(tool==='hand')?'none':'auto';c.style.cursor=tool==='erase'?'cell':(tool==='text'?'text':'crosshair');});}
+function toggleNight(){nightOn=!nightOn;panes.forEach(function(P){P.pagesEl.classList.toggle('night',nightOn);});$('nightb').classList.toggle('on',nightOn);}
 function setSaved(state,err){var s=$('saved');
  if(state==='saving'){s.textContent='Saving...';s.style.color='#d29922';}
- else if(state==='err'){s.textContent='Not saved';s.style.color='#f85149';s.title=err||'';if(err)showPdfToast(err);}
+ else if(state==='err'){s.textContent='Not saved';s.style.color='#f85149';s.title=err||'';if(err)toast('Could not save: '+err,7000);}
  else{s.textContent='Saved';s.style.color='#3fb950';s.title='';}}
-function showPdfToast(t){var m=$('pmsg');m.textContent='Could not save: '+t;m.style.display='block';setTimeout(hidePdfMsg,6000);}
-function pageWidth(){return Math.max(240,Math.round(($('scroll').clientWidth-36)*zoom));}
-function imgW(d){return Math.min(3200,Math.round(d.clientWidth*(window.devicePixelRatio||1)));}
-function initPdf(){
- docs=S.pdfs.map(function(n){return {name:n,scroll:0,info:null};});
- var t=$('tabs');
- if(docs.length>1){docs.forEach(function(d,i){var b=document.createElement('button');b.className='tab';b.textContent=d.name;b.onclick=function(){openDoc(i);};t.appendChild(b);});}
- else{t.style.display='none';}
- buildSwatches();
- $('scroll').addEventListener('scroll',function(){if(!raf){raf=requestAnimationFrame(function(){raf=0;updateVisible();});}});
- new ResizeObserver(function(){clearTimeout(resizeT);resizeT=setTimeout(relayout,200);}).observe($('scroll'));
- $('pgi').addEventListener('keydown',function(e){if(e.key==='Enter'){var n=parseInt(this.value,10)-1;if(!isNaN(n)&&pageEls.length){n=Math.max(0,Math.min(pageEls.length-1,n));$('scroll').scrollTop=pageEls[n].offsetTop-10;}this.blur();}});
- openDoc(0);
+function savePdf(){var P=activePane||panes[0];if(!P)return;setSaved('saving');api('/save',{doc:P.doc}).then(function(r){setSaved(r.err?'err':'ok',r.err);}).catch(function(){setSaved('err','server error');});}
+
+/* ================= PDF reader: page loading queue ================= */
+var Q={active:0,max:2,list:[]};
+function imgW(d){return Math.min(2400,Math.max(400,Math.round(d.clientWidth*(window.devicePixelRatio||1)/100)*100));}
+function reqPage(P,n){
+ var d=P.pages[n].el,w=imgW(d),key=P.doc+'-'+w+'-'+P.ver[n];
+ if(d.dataset.key===key||d.dataset.pending===key)return;
+ d.dataset.pending=key;Q.list.push({P:P,n:n,key:key,w:w,doc:P.doc,ver:P.ver[n]});pump();
 }
-function openDoc(i){
- if(cur>=0&&docs[cur])docs[cur].scroll=$('scroll').scrollTop;
- cur=i;undoStack=[];wordsCache={};pageEls=[];ver=[];
- var tb=document.querySelectorAll('.tab');for(var j=0;j<tb.length;j++)tb[j].classList.toggle('on',j===i);
- $('pages').innerHTML='';
- showPdfMsg('Loading '+docs[i].name+' ...');
- api('/pdfinfo/'+i).then(function(info){
-  if(cur!==i)return;
-  if(info.error){showPdfMsg('Could not open this PDF: '+info.error);return;}
-  docs[i].info=info;hidePdfMsg();buildPages();
-  $('scroll').scrollTop=docs[i].scroll||0;updateVisible(true);
-  $('ro').style.display=info.writable?'none':'inline';
- }).catch(function(){showPdfMsg('Could not load this PDF.');});
+function pump(){
+ while(Q.active<Q.max){
+  Q.list=Q.list.filter(function(t){var pg=t.P.pages[t.n];return !t.P.dead&&pg&&pg.el.dataset.pending===t.key;});
+  if(!Q.list.length)return;
+  var bi=0,bd=1e18;
+  Q.list.forEach(function(t,i){var d=t.P.pages[t.n].el,sc=t.P.scrollEl;var dd=Math.abs(d.offsetTop+d.offsetHeight/2-(sc.scrollTop+sc.clientHeight/2));if(dd<bd){bd=dd;bi=i;}});
+  runTask(Q.list.splice(bi,1)[0]);
+ }
 }
-function buildPages(){
- var info=docs[cur].info,W=pageWidth(),pages=$('pages');
- pages.innerHTML='';pageEls=[];ver=[];
- info.pages.forEach(function(sz,n){
-  var d=document.createElement('div');d.className='page';
-  d.style.width=W+'px';d.style.height=(W*sz[1]/sz[0])+'px';
-  var img=document.createElement('img');img.draggable=false;d.appendChild(img);
-  var cv=document.createElement('canvas');cv.className='ov';cv.width=W;cv.height=Math.round(W*sz[1]/sz[0]);d.appendChild(cv);
-  attach(cv,n);applyTool(cv);
-  pages.appendChild(d);pageEls.push(d);ver.push(0);
- });
- $('pgn').textContent='/ '+info.pages.length;
+function runTask(t){
+ Q.active++;var pg=t.P.pages[t.n],d=pg.el,ctrl=new AbortController();pg.abort=ctrl;
+ fetch(U('/page/'+t.doc+'/'+t.n,'w='+t.w+'&v='+t.ver),{signal:ctrl.signal}).then(function(r){if(!r.ok)throw new Error('x');return r.blob();}).then(function(b){
+  var url=URL.createObjectURL(b),im=new Image();
+  im.onload=function(){
+   if(d.dataset.pending===t.key){
+    if(pg.url)URL.revokeObjectURL(pg.url);
+    pg.url=url;pg.img.src=url;d.dataset.key=t.key;d.dataset.pending='';clearOv(pg.ov);
+   }else{URL.revokeObjectURL(url);}
+  };
+  im.onerror=function(){URL.revokeObjectURL(url);};
+  im.src=url;
+ }).catch(function(){}).then(function(){Q.active--;pump();});
 }
-function relayout(){
- if(cur<0||!docs[cur]||!docs[cur].info||!pageEls.length)return;
- var sc=$('scroll'),info=docs[cur].info,W=pageWidth();
- if(sc.clientWidth<80)return;
- if(pageEls[0].clientWidth===W)return;
- var ratioY=sc.scrollTop/Math.max(1,sc.scrollHeight);
- pageEls.forEach(function(d,n){var sz=info.pages[n];d.style.width=W+'px';d.style.height=(W*sz[1]/sz[0])+'px';d.dataset.key='';
-  var c=d.querySelector('canvas');c.width=W;c.height=Math.round(W*sz[1]/sz[0]);});
- sc.scrollTop=ratioY*sc.scrollHeight;updateVisible(true);
+function unloadPage(pg){
+ var d=pg.el;if(!d.dataset.key&&!d.dataset.pending)return;
+ d.dataset.key='';d.dataset.pending='';if(pg.abort){try{pg.abort.abort();}catch(e){}}
+ if(pg.url){URL.revokeObjectURL(pg.url);pg.url=null;}pg.img.removeAttribute('src');
 }
-function loadPage(n){var d=pageEls[n],w=imgW(d),key=w+'-'+ver[n];if(d.dataset.key===key)return;d.dataset.key=key;d.firstChild.src=U('/page/'+cur+'/'+n,'w='+w+'&v='+ver[n]);}
-function unloadPage(n){var d=pageEls[n];if(d.dataset.key){d.dataset.key='';d.firstChild.removeAttribute('src');}}
-function updateVisible(){
- var sc=$('scroll');if(!pageEls.length)return;
- var top=sc.scrollTop,vh=sc.clientHeight,lo=top-1400,hi=top+vh+1400,mid=top+vh*0.35,curP=0;
- for(var n=0;n<pageEls.length;n++){var d=pageEls[n],t=d.offsetTop,b=t+d.offsetHeight;
-  if(b>=lo&&t<=hi)loadPage(n);else unloadPage(n);
+function clearOv(cv){cv.getContext('2d').clearRect(0,0,cv.width,cv.height);}
+function updateVisible(P){
+ var sc=P.scrollEl;if(!P.pages.length)return;
+ var top=sc.scrollTop,vh=sc.clientHeight,lo=top-900,hi=top+vh+900,mid=top+vh*0.35,curP=0;
+ for(var n=0;n<P.pages.length;n++){var pg=P.pages[n],d=pg.el,t=d.offsetTop,b=t+d.offsetHeight;
+  if(b>=lo&&t<=hi)reqPage(P,n);else unloadPage(pg);
   if(t<=mid)curP=n;}
- if(document.activeElement!==$('pgi'))$('pgi').value=String(curP+1);
+ if(document.activeElement!==P.pgi)P.pgi.value=String(curP+1);
 }
-function refreshPage(n){
- var d=pageEls[n];if(!d)return;ver[n]++;var w=imgW(d),im=new Image(),v=ver[n];
- im.onload=function(){d.firstChild.src=im.src;d.dataset.key=w+'-'+v;clearOv(d.querySelector('canvas'));};
- im.onerror=function(){clearOv(d.querySelector('canvas'));};
- im.src=U('/page/'+cur+'/'+n,'w='+w+'&v='+v);
+function schedLoad(P){clearTimeout(P.lt);P.lt=setTimeout(function(){updateVisible(P);},120);}
+function pageW(P){return Math.max(240,Math.round((P.scrollEl.clientWidth-36)*P.zoom));}
+function relayout(P,force){
+ if(!P.info||!P.pages.length)return;var sc=P.scrollEl;if(sc.clientWidth<80)return;
+ var W=pageW(P);if(!force&&P.pages[0].el.clientWidth===W)return;
+ var ry=sc.scrollTop/Math.max(1,sc.scrollHeight);
+ P.pages.forEach(function(pg,n){var sz=P.info.pages[n],h=Math.round(W*sz[1]/sz[0]);
+  pg.el.style.width=W+'px';pg.el.style.height=h+'px';pg.el.dataset.pending='';
+  [pg.ov,pg.sr].forEach(function(c){c.width=W;c.height=h;});});
+ sc.scrollTop=ry*sc.scrollHeight;schedLoad(P);drawSearch(P);
 }
-function clearOv(cv){var c=cv.getContext('2d');c.clearRect(0,0,cv.width,cv.height);}
-function zoomBy(f){zoom=Math.max(0.4,Math.min(4,zoom*f));$('zl').textContent=Math.round(zoom*100)+'%';relayout();}
-function zoomFit(){zoom=1;$('zl').textContent='Fit';relayout();}
-function toggleNight(){var p=$('pages');p.classList.toggle('night');$('nightb').classList.toggle('on',p.classList.contains('night'));}
-function savePdf(){if(cur<0)return;setSaved('saving');api('/save',{doc:cur}).then(function(r){setSaved(r.err?'err':'ok',r.err);}).catch(function(){setSaved('err','server error');});}
-/* ---- tools ---- */
-function applyTool(cv){cv.style.pointerEvents=(tool==='hand')?'none':'auto';cv.style.cursor=tool==='erase'?'cell':'crosshair';}
-function setTool(t){
- tool=t;['hand','hl','draw','erase'].forEach(function(x){$('t-'+x).classList.toggle('on',x===t);});
- pageEls.forEach(function(d){applyTool(d.querySelector('canvas'));});
- $('inkw').style.display=(t==='draw')?'':'none';buildSwatches();
- if(t==='hl')prefetchWords();
+function refreshDocPage(doc,n){
+ panes.forEach(function(P){if(P.doc!==doc||!P.pages[n])return;P.ver[n]++;P.pages[n].el.dataset.pending='';reqPage(P,n);});
 }
-function buildSwatches(){
- var sw=$('sw');sw.innerHTML='';
- if(tool!=='hl'&&tool!=='draw')return;
- var cols=tool==='hl'?HL:INK,idx=tool==='hl'?hlIdx:inkIdx;
- cols.forEach(function(c,i){var b=document.createElement('button');b.className='dot'+(i===idx?' on':'');b.style.background=rgb(c);
-  b.onclick=function(){if(tool==='hl')hlIdx=i;else inkIdx=i;buildSwatches();};sw.appendChild(b);});
+
+/* ================= PDF reader: panes ================= */
+function makePane(docIdx){
+ var P={doc:docIdx,info:null,zoom:1,pages:[],ver:[],hits:[],hi:-1,query:'',dead:false,scrollPos:{}};
+ var el=document.createElement('div');el.className='pane pdfpane';
+ el.innerHTML='<div class="phead"><select class="dsel"></select><span class="sp"></span><input class="pgi" value="1"><span class="pgn">/ 1</span><button class="tool zm">&minus;</button><span class="zl">Fit</span><button class="tool zp">+</button><button class="tool zf">Fit</button><button class="tool pc" title="Close this pane">&times;</button></div><div class="scroll"><div class="pages"></div><div class="pmsg"></div></div>';
+ P.el=el;P.scrollEl=el.querySelector('.scroll');P.pagesEl=el.querySelector('.pages');P.msgEl=el.querySelector('.pmsg');
+ P.pgi=el.querySelector('.pgi');P.pgn=el.querySelector('.pgn');P.zl=el.querySelector('.zl');P.dsel=el.querySelector('.dsel');
+ S.pdfs.forEach(function(n,i){var o=document.createElement('option');o.value=i;o.textContent=n;P.dsel.appendChild(o);});
+ P.dsel.value=docIdx;P.dsel.onchange=function(){openDoc(P,parseInt(this.value,10));};
+ P.dsel.style.display=S.pdfs.length>1?'':'none';
+ el.querySelector('.zm').onclick=function(){zoomBy(P,1/1.15);};el.querySelector('.zp').onclick=function(){zoomBy(P,1.15);};
+ el.querySelector('.zf').onclick=function(){P.zoom=1;P.zl.textContent='Fit';relayout(P,true);};
+ el.querySelector('.pc').onclick=function(){closePane(P);};
+ P.scrollEl.addEventListener('scroll',function(){clearTimeout(P.st);P.st=setTimeout(function(){updateVisible(P);},60);});
+ new ResizeObserver(function(){clearTimeout(P.rt);P.rt=setTimeout(function(){relayout(P);},200);}).observe(P.scrollEl);
+ P.pgi.addEventListener('keydown',function(e){if(e.key==='Enter'){var n=parseInt(this.value,10)-1;if(!isNaN(n)&&P.pages.length){n=Math.max(0,Math.min(P.pages.length-1,n));P.scrollEl.scrollTop=P.pages[n].el.offsetTop-10;}this.blur();}});
+ el.addEventListener('mouseenter',function(){activePane=P;hoverPane='pp';});el.addEventListener('mouseleave',function(){if(hoverPane==='pp')hoverPane='';});
+ el.addEventListener('mousedown',function(){activePane=P;});
+ return P;
 }
-function ensureWords(n){
- var key=cur+':'+n;
- if(!wordsCache[key])wordsCache[key]=api('/words/'+cur+'/'+n).then(function(w){return Array.isArray(w)?w:[];}).catch(function(){return [];});
- return wordsCache[key];
+function zoomBy(P,f){P.zoom=Math.max(0.4,Math.min(4,P.zoom*f));P.zl.textContent=Math.round(P.zoom*100)+'%';relayout(P,true);}
+function openDoc(P,i){
+ if(P.info)P.scrollPos[P.doc]=P.scrollEl.scrollTop;
+ P.doc=i;P.dsel.value=i;P.info=null;P.hits=[];P.hi=-1;
+ P.pages.forEach(unloadPage);P.pages=[];P.ver=[];P.pagesEl.innerHTML='';
+ showMsg(P,'Loading '+S.pdfs[i]+' ...');
+ api('/pdfinfo/'+i).then(function(info){
+  if(P.doc!==i||P.dead)return;
+  if(info.error){showMsg(P,'Could not open this PDF: '+info.error);return;}
+  P.info=info;P.msgEl.style.display='none';buildPages(P);
+  P.scrollEl.scrollTop=P.scrollPos[i]||0;updateVisible(P);
+ }).catch(function(){showMsg(P,'Could not load this PDF.');});
 }
-function prefetchWords(){var sc=$('scroll'),top=sc.scrollTop,vh=sc.clientHeight;
- pageEls.forEach(function(d,n){if(d.offsetTop+d.offsetHeight>=top&&d.offsetTop<=top+vh)ensureWords(n);});}
-function pt(cv,e,n){var r=cv.getBoundingClientRect(),sz=docs[cur].info.pages[n],k=sz[0]/r.width;return [(e.clientX-r.left)*k,(e.clientY-r.top)*k];}
-function nearestWord(ws,p){
- var best=-1,bd=1e18;
- for(var i=0;i<ws.length;i++){var w=ws[i];
-  var dx=p[0]<w[0]?w[0]-p[0]:(p[0]>w[2]?p[0]-w[2]:0),dy=p[1]<w[1]?w[1]-p[1]:(p[1]>w[3]?p[1]-w[3]:0),d=dx*dx+dy*dy*4;
-  if(d<bd){bd=d;best=i;if(d===0)break;}}
- return best;
+function showMsg(P,t){P.msgEl.textContent=t;P.msgEl.style.display='block';}
+function buildPages(P){
+ var W=pageW(P);P.pagesEl.innerHTML='';P.pages=[];P.ver=[];
+ P.info.pages.forEach(function(sz,n){
+  var h=Math.round(W*sz[1]/sz[0]),d=document.createElement('div');d.className='page';d.style.width=W+'px';d.style.height=h+'px';
+  var img=document.createElement('img');img.draggable=false;d.appendChild(img);
+  var sr=document.createElement('canvas');sr.className='sr';sr.width=W;sr.height=h;d.appendChild(sr);
+  var ov=document.createElement('canvas');ov.className='ov';ov.width=W;ov.height=h;d.appendChild(ov);
+  var pg={el:d,img:img,sr:sr,ov:ov,url:null,abort:null};
+  attach(P,pg,n);P.pagesEl.appendChild(d);P.pages.push(pg);P.ver.push(0);
+ });
+ P.pgn.textContent='/ '+P.info.pages.length;
+ P.pagesEl.classList.toggle('night',nightOn);
+ applyToolTo(P);
 }
-function mergeLines(ws,a,b){
- var out=[],r=null;
- for(var i=a;i<=b;i++){var w=ws[i];
-  if(r&&Math.abs((w[1]+w[3])/2-(r[1]+r[3])/2)<(r[3]-r[1])*0.6){r[0]=Math.min(r[0],w[0]);r[1]=Math.min(r[1],w[1]);r[2]=Math.max(r[2],w[2]);r[3]=Math.max(r[3],w[3]);}
-  else{if(r)out.push(r);r=[w[0],w[1],w[2],w[3]];}}
- if(r)out.push(r);return out;
+function layoutPanes(){
+ var row=$('prow');
+ Array.prototype.slice.call(row.querySelectorAll('.vsplit')).forEach(function(s){s.remove();});
+ panes.forEach(function(P,i){
+  if(P.el.parentNode!==row)row.appendChild(P.el);
+  P.el.style.order=String(i*2);P.el.style.flex=(P.w||1)+' 1 0';
+  P.el.querySelector('.pc').style.display=panes.length>1?'':'none';
+  if(i<panes.length-1){
+   var sp=document.createElement('div');sp.className='vsplit';sp.style.order=String(i*2+1);
+   sp.addEventListener('mousedown',function(e){innerSplit(e,sp,panes[i],panes[i+1]);});row.appendChild(sp);}
+ });
+ $('addpane').style.display=panes.length>=3?'none':'';
 }
+function innerSplit(e,sp,A,B){
+ e.preventDefault();sp.classList.add('drag');
+ var ra=A.el.getBoundingClientRect(),rb=B.el.getBoundingClientRect(),total=(A.w||1)+(B.w||1),span=ra.width+rb.width,left=ra.left;
+ dragH(function(ev){var f=Math.max(0.15,Math.min(0.85,(ev.clientX-left)/span));A.w=total*f;B.w=total-A.w;A.el.style.flex=A.w+' 1 0';B.el.style.flex=B.w+' 1 0';},
+  function(){sp.classList.remove('drag');});
+}
+function addPane(){
+ if(panes.length>=3)return;
+ var next=(panes.length?(panes[panes.length-1].doc+1):0)%S.pdfs.length;
+ var P=makePane(next);P.w=1;panes.push(P);layoutPanes();openDoc(P,next);
+}
+function closePane(P){
+ if(panes.length<=1)return;P.dead=true;P.pages.forEach(unloadPage);P.el.remove();panes.splice(panes.indexOf(P),1);
+ if(activePane===P)activePane=panes[0];layoutPanes();
+}
+function initPdf(){
+ var P=makePane(0);P.w=1;panes.push(P);layoutPanes();setTool('hand');openDoc(P,0);
+ if(S.pdfs.length<2)$('addpane').title='Open a second view of the PDF';
+}
+
+/* ================= PDF reader: drawing / text / erase ================= */
+function pt(P,pg,e,n){var r=pg.ov.getBoundingClientRect(),k=P.info.pages[n][0]/r.width;return [(e.clientX-r.left)*k,(e.clientY-r.top)*k];}
 function simplify(pts){
  var out=[pts[0]];for(var i=1;i<pts.length;i++){var a=out[out.length-1],p=pts[i];if(Math.abs(p[0]-a[0])+Math.abs(p[1]-a[1])>0.8)out.push(p);}
  if(out.length<2)out.push(pts[pts.length-1]);if(out.length>3000)out=out.filter(function(_,i){return i%2===0;});return out;
 }
-function drawSel(){
- if(!sel||!sel.ws)return;
- var cv=sel.cv,c=cv.getContext('2d'),k=cv.width/docs[cur].info.pages[sel.n][0];
- if(sel.rect){c.clearRect(0,0,cv.width,cv.height);c.fillStyle=rgb(HL[hlIdx],0.4);
-  c.fillRect(Math.min(sel.start[0],sel.last[0])*k,Math.min(sel.start[1],sel.last[1])*k,Math.abs(sel.last[0]-sel.start[0])*k,Math.abs(sel.last[1]-sel.start[1])*k);return;}
- if(sel.i0<0||sel.i1<0)return;
- c.clearRect(0,0,cv.width,cv.height);c.fillStyle=rgb(HL[hlIdx],0.4);
- mergeLines(sel.ws,Math.min(sel.i0,sel.i1),Math.max(sel.i0,sel.i1)).forEach(function(r){c.fillRect(r[0]*k,r[1]*k,(r[2]-r[0])*k,(r[3]-r[1])*k);});
-}
+var stroke=null;
 function drawStroke(){
- var s=stroke,cv=s.cv,c=cv.getContext('2d');c.clearRect(0,0,cv.width,cv.height);
- c.strokeStyle=rgb(INK[inkIdx]);c.lineWidth=inkW*cv.width/docs[cur].info.pages[s.n][0];c.lineCap='round';c.lineJoin='round';
- c.beginPath();s.css.forEach(function(p,i){if(i===0)c.moveTo(p[0],p[1]);else c.lineTo(p[0],p[1]);});c.stroke();
+ var s=stroke,cv=s.pg.ov,c=cv.getContext('2d'),ppx=s.P.info.pages[s.n][0]/cv.width;
+ c.clearRect(0,0,cv.width,cv.height);
+ var o=s.kind==='hl'?OPT.hl:OPT.pen;
+ c.strokeStyle=rgb(PAL[s.kind][o.c],s.kind==='hl'?o.alpha:1);c.lineWidth=o.w/ppx;c.lineCap='round';c.lineJoin='round';
+ c.beginPath();s.css.forEach(function(p,i){if(i===0)c.moveTo(p[0],p[1]);else c.lineTo(p[0],p[1]);});
+ if(s.css.length===1)c.lineTo(s.css[0][0]+0.1,s.css[0][1]);c.stroke();
 }
-function attach(cv,n){
+function attach(P,pg,n){
+ var cv=pg.ov;
  cv.addEventListener('pointerdown',function(e){
   if(tool==='hand'||e.button!==0)return;
-  e.preventDefault();cv.setPointerCapture(e.pointerId);
-  var p=pt(cv,e,n);
-  if(tool==='draw'){stroke={n:n,cv:cv,pts:[p],css:[[e.offsetX,e.offsetY]]};}
-  else if(tool==='hl'){sel={n:n,cv:cv,ws:null,i0:-1,i1:-1,last:p,start:p,moved:false};
-   ensureWords(n).then(function(ws){if(!sel||sel.n!==n)return;sel.ws=ws;sel.rect=(ws.length===0);sel.i0=nearestWord(ws,sel.start);sel.i1=nearestWord(ws,sel.last);drawSel();});}
-  else if(tool==='erase'){eraseAt(n,p);}
+  e.preventDefault();activePane=P;
+  if(tool==='text'){startText(P,pg,n,e);return;}
+  cv.setPointerCapture(e.pointerId);var p=pt(P,pg,e,n);
+  if(tool==='hl'||tool==='pen'){stroke={P:P,pg:pg,n:n,kind:tool,pts:[p],css:[[e.offsetX,e.offsetY]]};drawStroke();}
+  else if(tool==='erase'){eraseAt(P,n,p);}
  });
  cv.addEventListener('pointermove',function(e){
-  if(stroke&&stroke.cv===cv){stroke.pts.push(pt(cv,e,n));stroke.css.push([e.offsetX,e.offsetY]);drawStroke();}
-  else if(sel&&sel.cv===cv){sel.last=pt(cv,e,n);
-   if(Math.abs(sel.last[0]-sel.start[0])+Math.abs(sel.last[1]-sel.start[1])>3)sel.moved=true;
-   if(sel.ws){if(!sel.rect)sel.i1=nearestWord(sel.ws,sel.last);drawSel();}}
+  if(stroke&&stroke.pg===pg){stroke.pts.push(pt(P,pg,e,n));stroke.css.push([e.offsetX,e.offsetY]);drawStroke();}
  });
- cv.addEventListener('pointerup',function(e){finishDrag(cv,n);});
- cv.addEventListener('pointercancel',function(e){stroke=null;sel=null;clearOv(cv);});
+ cv.addEventListener('pointerup',function(){
+  if(stroke&&stroke.pg===pg){var s=stroke;stroke=null;var o=s.kind==='hl'?OPT.hl:OPT.pen;
+   commit(P,n,{type:'ink',strokes:[simplify(s.pts)],color:PAL[s.kind][o.c],width:o.w,opacity:s.kind==='hl'?o.alpha:1});}
+ });
+ cv.addEventListener('pointercancel',function(){stroke=null;clearOv(cv);});
 }
-function finishDrag(cv,n){
- if(stroke&&stroke.cv===cv){var s=stroke;stroke=null;
-  if(s.pts.length>1){commit(n,{type:'ink',strokes:[simplify(s.pts)],color:INK[inkIdx],width:inkW});}else clearOv(cv);}
- else if(sel&&sel.cv===cv){var q=sel;sel=null;
-  if(q.moved&&q.ws&&q.rect){commit(n,{type:'highlight',rects:[[Math.min(q.start[0],q.last[0]),Math.min(q.start[1],q.last[1]),Math.max(q.start[0],q.last[0]),Math.max(q.start[1],q.last[1])]],color:HL[hlIdx]});}
-  else if(q.moved&&q.ws&&q.i0>=0&&q.i1>=0){commit(n,{type:'highlight',rects:mergeLines(q.ws,Math.min(q.i0,q.i1),Math.max(q.i0,q.i1)),color:HL[hlIdx]});}
-  else clearOv(cv);}
-}
-function commit(n,body){
- body.doc=cur;body.page=n;setSaved('saving');
+function commit(P,n,body){
+ body.doc=P.doc;body.page=n;setSaved('saving');
  api('/annot',body).then(function(r){
-  if(r.error){setSaved('err',r.error);clearOv(pageEls[n].querySelector('canvas'));return;}
+  if(r.error){setSaved('err',r.error);clearOv(P.pages[n].ov);return;}
   if(r.xref)undoStack.push({doc:body.doc,page:n,xref:r.xref});
-  setSaved(r.err?'err':'ok',r.err);refreshPage(n);
- }).catch(function(){setSaved('err','server error');});
+  setSaved(r.err?'err':'ok',r.err);refreshDocPage(body.doc,n);
+ }).catch(function(){setSaved('err','server error');clearOv(P.pages[n].ov);});
 }
-function eraseAt(n,p){
- api('/annots/'+cur+'/'+n).then(function(list){
+function eraseAt(P,n,p){
+ api('/annots/'+P.doc+'/'+n).then(function(list){
   var best=null,ba=1e18;
   (list||[]).forEach(function(a){var r=a.rect;
    if(p[0]>=r[0]-2&&p[0]<=r[2]+2&&p[1]>=r[1]-2&&p[1]<=r[3]+2){var ar=(r[2]-r[0])*(r[3]-r[1]);if(ar<ba){ba=ar;best=a;}}});
-  if(best){setSaved('saving');api('/annot_del',{doc:cur,page:n,xref:best.xref}).then(function(r){setSaved(r.err?'err':'ok',r.err);refreshPage(n);});}
+  if(best){setSaved('saving');api('/annot_del',{doc:P.doc,page:n,xref:best.xref}).then(function(r){setSaved(r.err?'err':'ok',r.err);refreshDocPage(P.doc,n);});}
  });
 }
 function undo(){
- var u=undoStack.pop();if(!u||u.doc!==cur)return;setSaved('saving');
- api('/annot_del',{doc:u.doc,page:u.page,xref:u.xref}).then(function(r){setSaved(r.err?'err':'ok',r.err);refreshPage(u.page);});
+ var u=undoStack.pop();if(!u)return;setSaved('saving');
+ api('/annot_del',{doc:u.doc,page:u.page,xref:u.xref}).then(function(r){setSaved(r.err?'err':'ok',r.err);refreshDocPage(u.doc,u.page);});
 }
+function startText(P,pg,n,e){
+ commitText();
+ var r=pg.ov.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,ppx=P.info.pages[n][0]/r.width;
+ var ta=document.createElement('textarea');ta.className='tbox';ta.style.left=x+'px';ta.style.top=y+'px';
+ ta.style.fontSize=(OPT.text.w/ppx)+'px';ta.style.color=rgb(PAL.text[OPT.text.c]);ta.style.width=Math.min(260,Math.max(120,r.width-x-8))+'px';ta.rows=1;
+ pg.el.appendChild(ta);
+ tb={ta:ta,P:P,n:n,x:x,y:y,k:ppx,done:false};
+ function grow(){ta.style.height='auto';ta.style.height=ta.scrollHeight+'px';}
+ ta.addEventListener('input',grow);
+ ta.addEventListener('keydown',function(ev){ev.stopPropagation();if(ev.key==='Enter'&&!ev.shiftKey){ev.preventDefault();commitText();}else if(ev.key==='Escape'){tb.done=true;ta.remove();tb=null;}});
+ ta.addEventListener('blur',function(){setTimeout(commitText,60);});
+ setTimeout(function(){ta.focus();grow();},0);
+}
+function commitText(){
+ if(!tb||tb.done)return;var t=tb;t.done=true;tb=null;
+ var val=t.ta.value.replace(/\s+$/,''),w=t.ta.offsetWidth,h=t.ta.scrollHeight;t.ta.remove();
+ if(!val)return;
+ if(/[^\u0000-\u00ff]/.test(val)){toast('The built-in PDF font can only draw Latin characters. Please remove other scripts.',6000);return;}
+ commit(t.P,t.n,{type:'text',text:val,size:OPT.text.w,color:PAL.text[OPT.text.c],rect:[t.x*t.k,t.y*t.k,(t.x+w)*t.k+6,(t.y+h)*t.k+8]});
+}
+
+/* ================= PDF reader: search ================= */
+function drawSearch(P){
+ if(!P.pages.length)return;
+ P.pages.forEach(function(pg){clearOv(pg.sr);});
+ var flat=P.hits;
+ flat.forEach(function(h,i){var pg=P.pages[h.page];if(!pg)return;var c=pg.sr.getContext('2d'),k=pg.sr.width/P.info.pages[h.page][0];
+  c.fillStyle=(i===P.hi)?'rgba(255,140,0,.55)':'rgba(255,220,0,.35)';c.fillRect(h.r[0]*k,h.r[1]*k,(h.r[2]-h.r[0])*k,(h.r[3]-h.r[1])*k);});
+}
+function runSearch(P,q){
+ P.query=q;
+ return fetch(U('/search/'+P.doc,'q='+encodeURIComponent(q))).then(function(r){return r.json();}).then(function(res){
+  P.hits=[];(res.hits||[]).forEach(function(h){h.rects.forEach(function(r){P.hits.push({page:h.page,r:r});});});
+  P.hi=P.hits.length?0:-1;drawSearch(P);showHit(P);
+  $('qc').textContent=P.hits.length?('1/'+P.hits.length):'0 found';
+ });
+}
+function showHit(P){
+ if(P.hi<0||!P.hits.length)return;var h=P.hits[P.hi],pg=P.pages[h.page];if(!pg)return;
+ var k=pg.el.clientWidth/P.info.pages[h.page][0];P.scrollEl.scrollTop=pg.el.offsetTop+h.r[1]*k-80;
+ drawSearch(P);$('qc').textContent=(P.hi+1)+'/'+P.hits.length;
+}
+function searchStep(d){
+ var P=activePane||panes[0];if(!P)return;var q=$('q').value.trim();
+ if(!q){P.hits=[];P.hi=-1;drawSearch(P);$('qc').textContent='';return;}
+ if(P.query!==q||!P.hits.length){runSearch(P,q);return;}
+ P.hi=(P.hi+d+P.hits.length)%P.hits.length;showHit(P);
+}
+$('q').addEventListener('keydown',function(e){e.stopPropagation();if(e.key==='Enter'){searchStep(e.shiftKey?-1:1);}else if(e.key==='Escape'){this.value='';searchStep(1);this.blur();}});
 
 /* ================= keyboard / wheel ================= */
 document.addEventListener('keydown',function(e){
+ if(capturing){
+  e.preventDefault();e.stopPropagation();
+  if(e.key==='Escape'){capturing=null;buildKeyUI();return;}
+  var c=combo(e);if(!c)return;setKey(capturing,e.key==='Backspace'?'':c);capturing=null;return;}
  var tg=e.target,typing=tg&&(tg.tagName==='INPUT'||tg.tagName==='SELECT'||tg.tagName==='TEXTAREA'),k=e.key||'';
  if(k==='F5'||k==='F11'||k==='F12'||(e.ctrlKey&&k.length===1&&'rpuownt'.indexOf(k.toLowerCase())>=0)){e.preventDefault();return;}
  if(e.ctrlKey&&k.toLowerCase()==='s'){e.preventDefault();savePdf();return;}
+ if(e.ctrlKey&&k.toLowerCase()==='f'&&hasPdf){e.preventDefault();$('q').focus();$('q').select();return;}
  if(typing){if(e.altKey)e.preventDefault();return;}
  if(e.ctrlKey&&k.toLowerCase()==='z'){e.preventDefault();undo();return;}
+ var act=keyAct[combo(e)];
+ if(act&&hasVideo){e.preventDefault();runAction(act);return;}
  if(hoverPane==='pv'&&hasVideo){
   if(k==='ArrowLeft'){seek(-10);e.preventDefault();}else if(k==='ArrowRight'){seek(10);e.preventDefault();}else if(k===' '){toggle();e.preventDefault();}}
 },true);
-document.addEventListener('wheel',function(e){if(e.ctrlKey){e.preventDefault();if(hoverPane==='pp')zoomBy(e.deltaY<0?1.1:1/1.1);}},{passive:false});
+document.addEventListener('wheel',function(e){if(e.ctrlKey){e.preventDefault();if(hoverPane==='pp'&&activePane)zoomBy(activePane,e.deltaY<0?1.1:1/1.1);}},{passive:false});
 document.addEventListener('contextmenu',function(e){e.preventDefault();});
 
 /* ================= state sync / boot ================= */
@@ -754,6 +926,10 @@ api('/state').then(function(s){
  $('views').style.display=(hasVideo&&hasPdf)?'flex':'none';
  $('swapb').style.display=(hasVideo&&hasPdf)?'':'none';
  $('vpp').style.display=hasVideo?'':'none';
+ $('speedbox').style.display=hasVideo?'flex':'none';
+ keys=JSON.parse(JSON.stringify(DEFAULT_KEYS));Object.keys(S.keys||{}).forEach(function(a){if(a in keys)keys[a]=S.keys[a];});
+ rebuildKeyMap();buildKeyUI();$('keys').style.display=hasVideo?'block':'none';
+ speed=Math.max(0.5,Math.min(3,S.speed||1));$('spv').textContent=speed.toFixed(1)+'x';
  applyLayout();
  if(hasVideo)loadYT();
  if(hasPdf)initPdf();
@@ -789,6 +965,8 @@ class PdfStore:
         self.lock = threading.RLock()
         self.docs = {}
         self.backed = set()
+        self.cache = OrderedDict()
+        self.ver = {}
         self.fz = load_fitz()
 
     def _need(self):
@@ -814,12 +992,43 @@ class PdfStore:
                 pages.append([round(r.width, 2), round(r.height, 2)])
             return {"pages": pages, "writable": os.access(path, os.W_OK)}
 
+    def _bump(self, path):
+        self.ver[path] = self.ver.get(path, 0) + 1
+        for k in [k for k in self.cache if k[0] == path]:
+            self.cache.pop(k, None)
+
     def render(self, path, n, width):
+        """Returns (bytes, content_type). Pages are cached; JPEG keeps rendering fast."""
         with self.lock:
+            key = (path, n, int(width), self.ver.get(path, 0))
+            hit = self.cache.get(key)
+            if hit is not None:
+                self.cache.move_to_end(key)
+                return hit
             page = self._doc(path)[n]
             scale = max(0.3, min(6.0, float(width) / max(1.0, page.rect.width)))
             pix = page.get_pixmap(matrix=self.fz.Matrix(scale, scale), alpha=False)
-            return pix.tobytes("png")
+            try:
+                res = (pix.tobytes("jpeg", jpg_quality=88), "image/jpeg")
+            except Exception:
+                res = (pix.tobytes("png"), "image/png")
+            self.cache[key] = res
+            while len(self.cache) > 40:
+                self.cache.popitem(last=False)
+            return res
+
+    def search(self, path, q):
+        with self.lock:
+            d = self._doc(path)
+            hits, total = [], 0
+            for i in range(len(d)):
+                rects = d[i].search_for(q)
+                if rects:
+                    hits.append({"page": i, "rects": [[r.x0, r.y0, r.x1, r.y1] for r in rects]})
+                    total += len(rects)
+                    if total >= 500:
+                        break
+            return {"hits": hits}
 
     def words(self, path, n):
         with self.lock:
@@ -892,10 +1101,25 @@ class PdfStore:
                 a = page.add_ink_annot(strokes)
                 a.set_colors(stroke=col)
                 a.set_border(width=float(b.get("width", 3)))
+                op = float(b.get("opacity", 1))
+                if op < 1:
+                    a.set_opacity(op)
                 a.update()
+            elif b.get("type") == "text":
+                size = float(b.get("size", 14))
+                rect = self.fz.Rect(*[float(v) for v in b["rect"]])
+                if rect.width < 40:
+                    rect.x1 = rect.x0 + 40
+                if rect.height < size * 1.6:
+                    rect.y1 = rect.y0 + size * 1.6
+                a = page.add_freetext_annot(rect, str(b["text"]), fontsize=size, fontname="helv",
+                                            text_color=col, align=0)
+                if a is None:
+                    raise RuntimeError("the text did not fit in its box")
             else:
                 raise RuntimeError("unknown annotation type")
             xref = a.xref
+            self._bump(path)
             return {"xref": xref, "err": self._persist(path)}
 
     def delete(self, path, n, xref):
@@ -905,6 +1129,7 @@ class PdfStore:
             a = page.load_annot(int(xref))
             if a is not None:
                 page.delete_annot(a)
+            self._bump(path)
             return {"err": self._persist(path)}
 
     def save(self, path):
@@ -972,8 +1197,12 @@ class LectureServer:
                     m = re.fullmatch(r"/page/(\d+)/(\d+)", path)
                     if m:
                         w = int(qs.get("w", ["1000"])[0])
-                        png = srv.store.render(self._pdf_path(m.group(1)), int(m.group(2)), w)
-                        return self._send_bytes(200, png, "image/png")
+                        data, ctype = srv.store.render(self._pdf_path(m.group(1)), int(m.group(2)), w)
+                        return self._send_bytes(200, data, ctype)
+                    m = re.fullmatch(r"/search/(\d+)", path)
+                    if m:
+                        q = qs.get("q", [""])[0]
+                        return self._json(srv.store.search(self._pdf_path(m.group(1)), q) if q else {"hits": []})
                     m = re.fullmatch(r"/words/(\d+)/(\d+)", path)
                     if m:
                         return self._json(srv.store.words(self._pdf_path(m.group(1)), int(m.group(2))))
@@ -1005,6 +1234,10 @@ class LectureServer:
                         a.q_cmds.put("resume")
                     elif path == "/audio":
                         a.q_cmds.put(("audio", body.get("cmd"), body.get("v")))
+                    elif path == "/speed":
+                        a.q_cmds.put(("speed", body.get("v")))
+                    elif path == "/keys":
+                        a.q_cmds.put(("keys", body.get("keys")))
                     elif path == "/layout":
                         a.q_cmds.put(("layout", body.get("split"), body.get("swap")))
                     elif path == "/annot":
@@ -1029,7 +1262,9 @@ class LectureServer:
 def run_player(url):
     """Alag process: fullscreen, always-on-top lecture window (Edge WebView2)."""
     try:
-        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--autoplay-policy=no-user-gesture-required"
+        os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
+            "--autoplay-policy=no-user-gesture-required --disable-web-security "
+            "--disable-site-isolation-trials --disable-features=IsolateOrigins,site-per-process")
         import webview
         webview.create_window("Study Lecture", url, fullscreen=True, on_top=True,
                               background_color="#0b0d14", easy_drag=False, text_select=False)
@@ -1042,6 +1277,119 @@ def run_player(url):
         except Exception:
             pass
         sys.exit(1)
+
+
+# ----------------------------------------------------------------- in-app updater
+class Updater:
+    """Checks the 'latest' GitHub release and replaces the running exe (no manual download)."""
+
+    def __init__(self):
+        self.state = "idle"   # idle | checking | uptodate | available | downloading | ready | error | unavailable
+        self.msg = ""
+        self.pct = 0
+        self.url = None
+        self.size = 0
+        self.dirty = True
+        self.frozen = bool(getattr(sys, "frozen", False))
+        self.exe = sys.executable
+        self._busy = False
+
+    def _set(self, state, msg="", pct=None):
+        self.state, self.msg = state, msg
+        if pct is not None:
+            self.pct = pct
+        self.dirty = True
+
+    def cleanup(self):
+        if self.frozen:
+            try:
+                if os.path.exists(self.exe + ".old"):
+                    os.remove(self.exe + ".old")
+            except Exception:
+                pass
+
+    def check(self):
+        if self._busy:
+            return
+        if not self.frozen:
+            self._set("unavailable", "Updates work in the .exe build only.")
+            return
+        self._busy = True
+        self._set("checking", "Checking for updates...")
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            req = urllib.request.Request(UPDATE_API, headers={"User-Agent": APP_NAME,
+                                                              "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.load(r)
+            body = (data.get("body") or "").strip()
+            sha = body.split()[0] if body else ""
+            asset = next((a for a in data.get("assets", []) if a.get("name", "").lower().endswith(".exe")), None)
+            if not asset:
+                raise RuntimeError("no build found on GitHub yet")
+            self.url = asset["browser_download_url"]
+            self.size = int(asset.get("size", 0) or 0)
+            if sha and BUILD_ID != "dev" and sha == BUILD_ID:
+                self._set("uptodate", "You are up to date.")
+            else:
+                self._set("available", "A new version is available.")
+        except Exception as e:
+            self._set("error", f"Could not check for updates: {e}")
+        finally:
+            self._busy = False
+
+    def install(self):
+        if self._busy or self.state != "available":
+            return
+        self._busy = True
+        self._set("downloading", "Downloading update...", 0)
+        threading.Thread(target=self._install, daemon=True).start()
+
+    def _install(self):
+        exe = self.exe
+        new = os.path.join(os.path.dirname(exe), "StudyLock.new.exe")
+        old = exe + ".old"
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": APP_NAME})
+            with urllib.request.urlopen(req, timeout=60) as r, open(new, "wb") as f:
+                total = int(r.headers.get("Content-Length") or self.size or 0)
+                got = 0
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total:
+                        self._set("downloading", "Downloading update...", int(got * 100 / total))
+            if os.path.getsize(new) < MIN_EXE_BYTES:
+                raise RuntimeError("the downloaded file looks incomplete")
+            with open(new, "rb") as f:
+                if f.read(2) != b"MZ":
+                    raise RuntimeError("the downloaded file is not a Windows program")
+            if os.path.exists(old):
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+            os.replace(exe, old)              # a running exe can be renamed on Windows
+            try:
+                os.replace(new, exe)
+            except Exception:
+                os.replace(old, exe)
+                raise
+            self._set("ready", "Update installed. Restart to use it.")
+        except Exception as e:
+            try:
+                if os.path.exists(new):
+                    os.remove(new)
+            except Exception:
+                pass
+            self._set("error", f"Update failed: {e}")
+        finally:
+            self._busy = False
 
 
 # ----------------------------------------------------------------- UI widgets
@@ -1691,6 +2039,8 @@ class App:
         root.configure(bg=BG)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self.updater = Updater()
+        self.updater.cleanup()
         self.build_ui()
 
         s = self.data["settings"]["self"]
@@ -1704,6 +2054,8 @@ class App:
         self.views["lecture"].update_lec_label()
         dark_titlebar(root)
         self.show_page("self")
+        if self.updater.frozen:
+            root.after(5000, self.updater.check)       # quiet check a few seconds after start
         self.tick()
 
     # ---------- layout
@@ -1723,6 +2075,11 @@ class App:
 
         box = tk.Frame(side, bg=BORDER)
         box.pack(side="bottom", fill="x", padx=14, pady=16)
+        self.upd_btn = Btn(side, "Check for updates", self.on_update_click, "secondary", size=9, padx=12, pady=7)
+        self.upd_btn.pack(side="bottom", fill="x", padx=14)
+        self.upd_lbl = tk.Label(side, text="", bg=SIDEBAR, fg=MUTED, font=(FONT, 8), wraplength=190,
+                                justify="left", anchor="w")
+        self.upd_lbl.pack(side="bottom", fill="x", padx=16, pady=(0, 6))
         inner = tk.Frame(box, bg=SURFACE, padx=14, pady=12)
         inner.pack(fill="x", padx=1, pady=1)
         tk.Label(inner, text="TODAY", bg=SURFACE, fg=MUTED, font=(FONT, 8, "bold")).pack(anchor="w")
@@ -1940,6 +2297,58 @@ class App:
             save_data(self.data)
             self.refresh_doubts()
 
+    def on_update_click(self):
+        u = self.updater
+        if u.state == "available":
+            if self.phase != "idle":
+                messagebox.showinfo(APP_NAME, "Please finish or end the current session before updating.")
+                return
+            if messagebox.askyesno("Update StudyLock", "Download and install the new version now?\n"
+                                   "Your data and settings are kept."):
+                u.install()
+        elif u.state == "ready":
+            self.restart_app()
+        elif u.state in ("idle", "uptodate", "error", "unavailable"):
+            u.check()
+
+    def update_ui(self):
+        u = self.updater
+        ver = BUILD_ID[:7] if BUILD_ID != "dev" else "dev"
+        lbl, btn, kind, en = f"Version {ver}", "Check for updates", "secondary", True
+        if u.state == "checking":
+            lbl, btn, en = "Checking for updates...", "Please wait", False
+        elif u.state == "uptodate":
+            lbl, btn = f"Up to date ({ver})", "Check again"
+        elif u.state == "available":
+            lbl, btn, kind = "A new version is available.", "Update now", "success"
+        elif u.state == "downloading":
+            lbl, btn, en = f"Downloading update... {u.pct}%", "Downloading", False
+        elif u.state == "ready":
+            lbl, btn, kind = "Update installed.", "Restart now", "primary"
+        elif u.state in ("error", "unavailable"):
+            lbl, btn = u.msg[:70], "Retry" if u.state == "error" else "OK"
+            en = u.state == "error"
+        self.upd_lbl.config(text=lbl)
+        self.upd_btn.set_text(btn)
+        self.upd_btn.set_kind(kind)
+        self.upd_btn.enable(en)
+        u.dirty = False
+
+    def restart_app(self):
+        exe = sys.executable
+        self.stop_player()
+        self.blocker.stop()
+        self.audio.close()
+        save_data(self.data)
+        env = dict(os.environ)
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        try:
+            subprocess.Popen([exe], env=env, close_fds=True,
+                             creationflags=(0x00000008 | 0x00000200) if IS_WIN else 0)
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Could not restart automatically: {e}\nPlease start StudyLock again.")
+        self.root.destroy()
+
     def drain_cmds(self):
         while True:
             try:
@@ -1959,6 +2368,16 @@ class App:
                     self.sync_audio_buttons()
                 elif c[1] == "volume" and c[2] is not None:
                     self.on_volume(c[2])
+            elif isinstance(c, tuple) and c[0] == "speed":
+                try:
+                    self.data["settings"]["lecture"]["speed"] = max(0.5, min(3.0, round(float(c[1]), 1)))
+                    save_data(self.data)
+                except Exception:
+                    pass
+            elif isinstance(c, tuple) and c[0] == "keys":
+                if isinstance(c[1], dict):
+                    self.data["settings"]["keys"] = {str(k): str(v) for k, v in c[1].items()}
+                    save_data(self.data)
             elif isinstance(c, tuple) and c[0] == "layout":
                 try:
                     lec = self.data["settings"]["lecture"]
@@ -2141,6 +2560,7 @@ class App:
         lec = self.data["settings"]["lecture"]
         return {"video_id": self.lec_vid, "has_video": bool(self.lec_active), "mode": self.mode,
                 "start": self.lec_start, "split": lec.get("split", 55), "swap": lec.get("swap", False),
+                "speed": lec.get("speed", 1.0), "keys": self.data["settings"].get("keys", {}),
                 "phase": self.phase, "phase_end": self.phase_end * 1000,
                 "paused_rem": self.paused_rem, "phase_total": self.phase_total,
                 "cycle": self.cycle, "cycles": self.cycles,
@@ -2321,6 +2741,8 @@ class App:
             d = 0
         self.drain_doubts()
         self.drain_cmds()
+        if self.updater.dirty:
+            self.update_ui()
 
         if self.phase == "study":
             self.add_study(d)

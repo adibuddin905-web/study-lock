@@ -3,7 +3,6 @@ name: Build Windows EXE
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -22,8 +21,12 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller pywebview pymupdf
 
+      - name: Stamp build id
+        shell: bash
+        run: echo "BUILD_ID = '${{ github.sha }}'" > build_id.py
+
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole --name StudyLock --collect-all webview --collect-all pythonnet --collect-all clr_loader --collect-all pymupdf --hidden-import clr study_lock.py
+        run: pyinstaller --onefile --noconsole --name StudyLock --collect-all webview --collect-all pythonnet --collect-all clr_loader --collect-all pymupdf --hidden-import clr --hidden-import build_id study_lock.py
 
       - name: Upload EXE as artifact
         uses: actions/upload-artifact@v4
@@ -31,8 +34,15 @@ jobs:
           name: StudyLock-windows
           path: dist/StudyLock.exe
 
-      - name: Publish release (only for tags like v1.0)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - name: Publish as the "latest" release (used by the in-app Update button)
+        uses: ncipollo/release-action@v1
         with:
-          files: dist/StudyLock.exe
+          tag: latest
+          name: StudyLock (latest build)
+          body: ${{ github.sha }}
+          artifacts: dist/StudyLock.exe
+          allowUpdates: true
+          replacesArtifacts: true
+          makeLatest: true
+          commit: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}

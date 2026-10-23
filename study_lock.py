@@ -341,6 +341,11 @@ button,select,input,textarea{font-family:inherit}
 #speedbox button:hover{background:#30363d}
 #speedbox #srs{width:auto;padding:0 8px;font-size:12px;color:var(--mut)}
 #spv{min-width:46px;text-align:center;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+#tpop{display:none;position:absolute;left:0;top:44px;z-index:70;width:236px;background:var(--sur);border:1px solid var(--line);border-radius:12px;padding:12px;box-shadow:0 12px 40px rgba(0,0,0,.55)}
+.trow2{display:flex;gap:6px;margin-top:8px}
+.trow2 .b{flex:1;padding:8px 6px}
+#extn{flex:2;min-width:0;background:var(--sur2);border:1px solid var(--line);border-radius:9px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;user-select:text}
+#extn:focus{border-color:var(--accent)}
 /* ---- panes ---- */
 #main{flex:1;display:flex;min-height:0;position:relative}
 .pane{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
@@ -413,6 +418,10 @@ button,select,input,textarea{font-family:inherit}
  <div id="bar">
   <span class="brand" id="brand">Study</span><span class="chip" id="phase">Session</span>
   <b id="timer">--:--</b>
+  <div style="position:relative"><button class="b" id="extb" onclick="toggleExt()">+ Time</button>
+   <div id="tpop"><div class="lbl">Add time to this session</div>
+    <div class="trow2"><button class="b" onclick="extend(5)">+5</button><button class="b" onclick="extend(10)">+10</button><button class="b" onclick="extend(15)">+15</button><button class="b" onclick="extend(30)">+30</button></div>
+    <div class="trow2"><input id="extn" type="number" min="1" max="180" placeholder="minutes"><button class="b acc" onclick="extendCustom()">Add</button></div></div></div>
   <div class="sp"></div>
   <div id="speedbox"><button id="sdn" title="Slower">&minus;</button><span id="spv">1.0x</span><button id="sup" title="Faster">+</button><button id="srs" title="Reset speed">1x</button></div>
   <div class="seg" id="views" style="display:none"><button id="v-video" onclick="setView('video')">Video</button><button id="v-split" class="on" onclick="setView('split')">Split</button><button id="v-pdf" onclick="setView('pdf')">PDF</button></div>
@@ -497,6 +506,10 @@ $('split').addEventListener('mousedown',function(e){
  dragH(function(ev){var r=$('main').getBoundingClientRect();var x=(ev.clientX-r.left)/r.width*100;ratio=swap?100-x:x;ratio=Math.max(20,Math.min(80,ratio));applyLayout();},
   function(){sp.classList.remove('drag');api('/layout',{split:ratio,swap:swap});});
 });
+function toggleExt(){var p=$('tpop');p.style.display=p.style.display==='block'?'none':'block';if(p.style.display==='block')$('extn').focus();}
+function extend(m){api('/extend',{minutes:m});$('tpop').style.display='none';toast('+'+m+' min added to this session',2500);}
+function extendCustom(){var m=parseInt($('extn').value,10);if(!m||m<1)return;$('extn').value='';extend(Math.min(180,m));}
+$('extn').addEventListener('keydown',function(e){if(e.key==='Enter')extendCustom();});
 function toggleDrawer(){var d=$('drawer');d.style.display=d.style.display==='block'?'none':'block';if(d.style.display==='block')$('inp').focus();}
 $('pv').addEventListener('mouseenter',function(){hoverPane='pv';});$('pv').addEventListener('mouseleave',function(){hoverPane='';});
 
@@ -920,6 +933,7 @@ function renderTop(){
  if(!S)return;
  var paused=(S.phase==='paused'),rem=paused?S.paused_rem:(S.phase_end-Date.now())/1000;
  $('timer').textContent=tm(rem);
+ var low=!paused&&rem<=60&&rem>0;$('timer').style.color=low?'#d29922':'';$('extb').className='b'+(low?' acc':'');
  $('phase').textContent=paused?'Paused':('Session '+S.cycle+' of '+S.cycles);
  var f=1-rem/Math.max(1,S.phase_total);$('prog').style.width=Math.max(0,Math.min(1,f))*100+'%';
  $('prog').style.background=paused?'#d29922':'';
@@ -984,13 +998,14 @@ class PdfStore:
     * A background saver writes the whole PDF back into the ORIGINAL file shortly after the last
       edit (temp file + atomic replace, retried if another program is touching the file).
     * If a save fails the edits stay in memory and are retried; nothing is thrown away.
+    * No backup copies are made. (Only if the original file can not be written at all when the
+      session closes, one rescue copy of your edits is stored so they are not lost.)
     """
     SAVE_DELAY = 0.6
 
     def __init__(self):
         self.lock = threading.RLock()
         self.docs = {}              # path -> {"doc", "dirty", "t", "err"}
-        self.backed = set()
         self.cache = OrderedDict()
         self.ver = {}
         self.fz = load_fitz()
@@ -1115,19 +1130,6 @@ class PdfStore:
             return {"hits": hits}
 
     # ---- editing (in memory) + saving
-    def _backup(self, path):
-        """One safety copy of the original, made right before the first edit of this run."""
-        if path in self.backed:
-            return
-        self.backed.add(path)
-        try:
-            import shutil
-            os.makedirs(BACKUP_DIR, exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            shutil.copy2(path, os.path.join(BACKUP_DIR, f"{os.path.basename(path)}.{stamp}.bak"))
-        except Exception as e:
-            pdf_log(f"backup failed {path}: {e}")
-
     def _dirty(self, path, e):
         e["dirty"] = True
         e["t"] = time.monotonic()
@@ -1135,7 +1137,6 @@ class PdfStore:
 
     def add(self, path, n, b):
         with self.lock:
-            self._backup(path)
             e = self._entry(path)
             page = e["doc"][n]
             kind = b.get("type")
@@ -1184,7 +1185,6 @@ class PdfStore:
 
     def delete(self, path, n, xref):
         with self.lock:
-            self._backup(path)
             e = self._entry(path)
             page = e["doc"][n]
             a = page.load_annot(int(xref))
@@ -1401,6 +1401,8 @@ class LectureServer:
                         a.q_cmds.put("resume")
                     elif path == "/audio":
                         a.q_cmds.put(("audio", body.get("cmd"), body.get("v")))
+                    elif path == "/extend":
+                        a.q_cmds.put(("extend", body.get("minutes")))
                     elif path == "/speed":
                         a.q_cmds.put(("speed", body.get("v")))
                     elif path == "/keys":
@@ -2159,7 +2161,8 @@ class ProgressView(tk.Frame):
 
 
 # ----------------------------------------------------------------- application
-LOCK_ATTRS = ("l_ring", "l_msg", "l_entry", "l_lb", "l_count", "l_play", "l_vol", "lv_doubt", "l_prayer")
+LOCK_ATTRS = ("l_ring", "l_msg", "l_entry", "l_lb", "l_count", "l_play", "l_vol", "lv_doubt", "l_prayer",
+              "l_extra", "v_ext")
 
 
 class App:
@@ -2537,6 +2540,8 @@ class App:
                     self.sync_audio_buttons()
                 elif c[1] == "volume" and c[2] is not None:
                     self.on_volume(c[2])
+            elif isinstance(c, tuple) and c[0] == "extend":
+                self.extend_session(c[1])
             elif isinstance(c, tuple) and c[0] == "speed":
                 try:
                     self.data["settings"]["lecture"]["speed"] = max(0.5, min(3.0, round(float(c[1]), 1)))
@@ -2687,6 +2692,32 @@ class App:
         self.sync_audio_buttons()
         self.sync_prayer_btn()
         self.beep()
+
+    def extend_session(self, minutes):
+        """Add minutes to the running focus session (also while it is paused for prayer)."""
+        try:
+            m = max(1, min(180, int(float(minutes))))
+        except (TypeError, ValueError):
+            return False
+        if self.phase == "study":
+            self.phase_end += m * 60
+        elif self.phase == "paused" and self.resume_phase == "study":
+            self.paused_rem += m * 60
+        else:
+            return False
+        self.phase_total += m * 60
+        if self.lock and hasattr(self, "l_extra"):
+            self.l_extra.config(text=f"+{m} min added")
+            self.root.after(3500, lambda: self.l_extra.config(text="") if self.lock and hasattr(self, "l_extra") else None)
+        return True
+
+    def extend_custom(self):
+        try:
+            m = int(self.v_ext.get().strip())
+        except (ValueError, AttributeError):
+            return
+        self.v_ext.set("")
+        self.extend_session(m)
 
     def toggle_pause(self):
         if self.phase == "paused":
@@ -2884,6 +2915,22 @@ class App:
         if self.player_kind:
             Btn(bottom, "Retry player", self.retry_player, "secondary").pack(side="left", padx=(0, 12))
         self._prayer_btn(bottom).pack(side="left")
+
+        erow = tk.Frame(box, bg=LOCK_BG)
+        erow.pack(pady=(16, 0))
+        tk.Label(erow, text="Need more time?", bg=LOCK_BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=(0, 10))
+        for m in (5, 10, 15):
+            Btn(erow, f"+{m} min", lambda m=m: self.extend_session(m), "secondary", size=9, padx=12,
+                pady=6).pack(side="left", padx=3)
+        self.v_ext = tk.StringVar()
+        ee = tk.Entry(erow, textvariable=self.v_ext, width=4, justify="center", bg=SURFACE, fg=TEXT,
+                      insertbackground=TEXT, relief="flat", font=(FONT, 11), highlightthickness=1,
+                      highlightbackground=BORDER, highlightcolor=accent)
+        ee.pack(side="left", padx=(10, 4), ipady=4)
+        ee.bind("<Return>", lambda e: self.extend_custom())
+        Btn(erow, "Add min", self.extend_custom, "primary", size=9, padx=12, pady=6).pack(side="left")
+        self.l_extra = tk.Label(erow, text="", bg=LOCK_BG, fg=GOOD, font=(FONT, 10, "bold"))
+        self.l_extra.pack(side="left", padx=10)
 
     def close_lock(self):
         self.blocker.stop()

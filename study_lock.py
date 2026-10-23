@@ -818,20 +818,20 @@ function commit(P,n,body){
  api('/annot',body).then(function(r){
   if(r.error){setSaved('err',r.error);clearOv(P.pages[n].ov);return;}
   if(r.xref)undoStack.push({doc:body.doc,page:n,xref:r.xref});
-  setSaved(r.err?'err':'ok',r.err);refreshDocPage(body.doc,n);
+  if(r.err)setSaved('err',r.err);refreshDocPage(body.doc,n);
  }).catch(function(){setSaved('err','server error');clearOv(P.pages[n].ov);});
 }
 function eraseAt(P,n,p){
  api('/annots/'+P.doc+'/'+n).then(function(list){
   var best=null,ba=1e18;
-  (list||[]).forEach(function(a){var r=a.rect;
-   if(p[0]>=r[0]-2&&p[0]<=r[2]+2&&p[1]>=r[1]-2&&p[1]<=r[3]+2){var ar=(r[2]-r[0])*(r[3]-r[1]);if(ar<ba){ba=ar;best=a;}}});
-  if(best){setSaved('saving');api('/annot_del',{doc:P.doc,page:n,xref:best.xref}).then(function(r){setSaved(r.err?'err':'ok',r.err);refreshDocPage(P.doc,n);});}
+  (list||[]).forEach(function(a){[a.rect,a.rect2].forEach(function(r){
+   if(r&&p[0]>=r[0]-2&&p[0]<=r[2]+2&&p[1]>=r[1]-2&&p[1]<=r[3]+2){var ar=(r[2]-r[0])*(r[3]-r[1]);if(ar<ba){ba=ar;best=a;}}});});
+  if(best){setSaved('saving');api('/annot_del',{doc:P.doc,page:n,xref:best.xref}).then(function(r){if(r.err)setSaved('err',r.err);refreshDocPage(P.doc,n);});}
  });
 }
 function undo(){
  var u=undoStack.pop();if(!u)return;setSaved('saving');
- api('/annot_del',{doc:u.doc,page:u.page,xref:u.xref}).then(function(r){setSaved(r.err?'err':'ok',r.err);refreshDocPage(u.doc,u.page);});
+ api('/annot_del',{doc:u.doc,page:u.page,xref:u.xref}).then(function(r){if(r.err)setSaved('err',r.err);refreshDocPage(u.doc,u.page);});
 }
 function startText(P,pg,n,e){
  commitText();
@@ -904,8 +904,13 @@ document.addEventListener('wheel',function(e){if(e.ctrlKey){e.preventDefault();i
 document.addEventListener('contextmenu',function(e){e.preventDefault();});
 
 /* ================= state sync / boot ================= */
+var lastPdfErr='';
 function sync(s){
  S=s;syncPause();
+ if(s.pdf){var sv=$('saved');
+  if(s.pdf.err){if(s.pdf.err!==lastPdfErr){lastPdfErr=s.pdf.err;toast('Could not save PDF edits (will keep retrying): '+s.pdf.err,9000);}
+   sv.textContent='Not saved';sv.style.color='#f85149';sv.title=s.pdf.err;}
+  else{lastPdfErr='';if(s.pdf.dirty){sv.textContent='Saving...';sv.style.color='#d29922';}else{sv.textContent='Saved';sv.style.color='#3fb950';sv.title='';}}}
  $('dbtn').textContent='Doubts ('+S.doubts+')';
  var ul=$('dlist');ul.innerHTML='';
  (S.doubt_list||[]).forEach(function(t){var li=document.createElement('li');li.textContent=t;ul.insertBefore(li,ul.firstChild);});
@@ -957,29 +962,60 @@ def load_fitz():
         return None
 
 
+PDF_LOG = os.path.join(os.path.expanduser("~"), ".study_lock_pdf.log")
+
+
+def pdf_log(msg):
+    """Tiny diagnostic log (C:\\Users\\<you>\\.study_lock_pdf.log) so save problems can be traced."""
+    try:
+        if os.path.exists(PDF_LOG) and os.path.getsize(PDF_LOG) > 400_000:
+            os.replace(PDF_LOG, PDF_LOG + ".old")
+        with open(PDF_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n")
+    except Exception:
+        pass
+
+
 class PdfStore:
-    """PDF engine (PyMuPDF): renders pages, finds words, adds / removes highlights and ink,
-    and saves the edits straight back into the ORIGINAL file (incremental save)."""
+    """PDF engine (PyMuPDF).
+
+    * Each PDF is read into memory once, so StudyLock never keeps the original file locked.
+    * Edits (pen highlighter, pen, text, eraser) are applied in memory immediately.
+    * A background saver writes the whole PDF back into the ORIGINAL file shortly after the last
+      edit (temp file + atomic replace, retried if another program is touching the file).
+    * If a save fails the edits stay in memory and are retried; nothing is thrown away.
+    """
+    SAVE_DELAY = 0.6
 
     def __init__(self):
         self.lock = threading.RLock()
-        self.docs = {}
+        self.docs = {}              # path -> {"doc", "dirty", "t", "err"}
         self.backed = set()
         self.cache = OrderedDict()
         self.ver = {}
         self.fz = load_fitz()
+        self.saving = False
+        threading.Thread(target=self._saver, daemon=True).start()
 
+    # ---- documents
     def _need(self):
         if self.fz is None:
             raise RuntimeError("PDF engine (PyMuPDF) is not installed in this build")
 
-    def _doc(self, path):
+    def _entry(self, path):
         self._need()
-        d = self.docs.get(path)
-        if d is None:
-            d = self.fz.open(path)
-            self.docs[path] = d
-        return d
+        e = self.docs.get(path)
+        if e is None:
+            with open(path, "rb") as f:
+                data = f.read()
+            d = self.fz.open(stream=data, filetype="pdf")
+            e = {"doc": d, "dirty": False, "t": 0.0, "err": None}
+            self.docs[path] = e
+            pdf_log(f"opened {path} ({len(data)} bytes, {len(d)} pages)")
+        return e
+
+    def _doc(self, path):
+        return self._entry(path)["doc"]
 
     def info(self, path):
         with self.lock:
@@ -990,7 +1026,8 @@ class PdfStore:
             for i in range(len(d)):
                 r = d[i].rect
                 pages.append([round(r.width, 2), round(r.height, 2)])
-            return {"pages": pages, "writable": os.access(path, os.W_OK)}
+            writable = os.access(path, os.W_OK) and os.access(os.path.dirname(path) or ".", os.W_OK)
+            return {"pages": pages, "writable": bool(writable)}
 
     def _bump(self, path):
         self.ver[path] = self.ver.get(path, 0) + 1
@@ -1017,19 +1054,34 @@ class PdfStore:
                 self.cache.popitem(last=False)
             return res
 
-    def search(self, path, q):
-        with self.lock:
-            d = self._doc(path)
-            hits, total = [], 0
-            for i in range(len(d)):
-                rects = d[i].search_for(q)
-                if rects:
-                    hits.append({"page": i, "rects": [[r.x0, r.y0, r.x1, r.y1] for r in rects]})
-                    total += len(rects)
-                    if total >= 500:
-                        break
-            return {"hits": hits}
+    # ---- coordinates: the page shows the ROTATED view, annotations are stored UNROTATED
+    def _unrot_pt(self, page, x, y):
+        if not page.rotation:
+            return (x, y)
+        p = self.fz.Point(x, y) * page.derotation_matrix
+        return (p.x, p.y)
 
+    def _unrot_rect(self, page, r):
+        rect = self.fz.Rect(*[float(v) for v in r])
+        if page.rotation:
+            rect = rect * page.derotation_matrix
+            rect.normalize()
+        return rect
+
+    def _visible(self, page, r):
+        """Rect -> [x0, y0, x1, y1] in the coordinates shown on screen."""
+        if page.rotation:
+            pr = page.rect
+
+            def inside(q):
+                return q.x0 >= pr.x0 - 1 and q.y0 >= pr.y0 - 1 and q.x1 <= pr.x1 + 1 and q.y1 <= pr.y1 + 1
+            if not inside(r):
+                q = r * page.rotation_matrix
+                q.normalize()
+                r = q
+        return [r.x0, r.y0, r.x1, r.y1]
+
+    # ---- reading
     def words(self, path, n):
         with self.lock:
             page = self._doc(path)[n]
@@ -1042,9 +1094,27 @@ class PdfStore:
             out = []
             for a in (page.annots() or []):
                 r = a.rect
-                out.append({"xref": a.xref, "type": a.type[1], "rect": [r.x0, r.y0, r.x1, r.y1]})
+                item = {"xref": a.xref, "type": a.type[1], "rect": [r.x0, r.y0, r.x1, r.y1]}
+                if page.rotation:                       # also offer the rotated view of the same box
+                    item["rect2"] = self._visible(page, r)
+                out.append(item)
             return out
 
+    def search(self, path, q):
+        with self.lock:
+            d = self._doc(path)
+            hits, total = [], 0
+            for i in range(len(d)):
+                page = d[i]
+                rects = page.search_for(q)
+                if rects:
+                    hits.append({"page": i, "rects": [self._visible(page, r) for r in rects]})
+                    total += len(rects)
+                    if total >= 500:
+                        break
+            return {"hits": hits}
+
+    # ---- editing (in memory) + saving
     def _backup(self, path):
         """One safety copy of the original, made right before the first edit of this run."""
         if path in self.backed:
@@ -1056,94 +1126,191 @@ class PdfStore:
             stamp = time.strftime("%Y%m%d-%H%M%S")
             shutil.copy2(path, os.path.join(BACKUP_DIR, f"{os.path.basename(path)}.{stamp}.bak"))
         except Exception as e:
-            print("backup failed", e)
+            pdf_log(f"backup failed {path}: {e}")
 
-    def _persist(self, path):
-        """Save into the original file. Returns None on success or an error string."""
-        d = self.docs.get(path)
-        if d is None:
-            return None
-        try:
-            if d.can_save_incrementally():
-                fn = getattr(d, "saveIncr", None) or getattr(d, "save_incr")
-                fn()
-                return None
-        except Exception as e:
-            first = str(e)
-        else:
-            first = ""
-        try:                                   # fallback: full rewrite, then replace the original
-            tmp = path + ".studylock.tmp"
-            d.save(tmp, garbage=0, deflate=True)
-            d.close()
-            self.docs.pop(path, None)
-            os.replace(tmp, path)
-            return None
-        except Exception as e:
-            self.docs.pop(path, None)
-            return (first + " / " if first else "") + str(e)
+    def _dirty(self, path, e):
+        e["dirty"] = True
+        e["t"] = time.monotonic()
+        self._bump(path)
 
     def add(self, path, n, b):
         with self.lock:
             self._backup(path)
-            d = self._doc(path)
-            page = d[n]
+            e = self._entry(path)
+            page = e["doc"][n]
+            kind = b.get("type")
             col = tuple(max(0.0, min(1.0, float(c))) for c in b.get("color", [1, 0.9, 0.2]))[:3]
-            if b.get("type") == "highlight":
-                quads = [self.fz.Rect(*[float(v) for v in r]) for r in b["rects"]]
+            if kind == "highlight":
+                quads = [self._unrot_rect(page, r) for r in b["rects"]]
                 a = page.add_highlight_annot(quads=quads)
                 if a is None:
                     raise RuntimeError("could not create the highlight")
                 a.set_colors(stroke=col)
                 a.update()
-            elif b.get("type") == "ink":
-                strokes = [[(float(x), float(y)) for x, y in s] for s in b["strokes"]]
+            elif kind == "ink":
+                strokes = [[self._unrot_pt(page, float(x), float(y)) for x, y in s] for s in b["strokes"]]
                 a = page.add_ink_annot(strokes)
+                if a is None:
+                    raise RuntimeError("could not create the stroke")
                 a.set_colors(stroke=col)
                 a.set_border(width=float(b.get("width", 3)))
                 op = float(b.get("opacity", 1))
                 if op < 1:
                     a.set_opacity(op)
                 a.update()
-            elif b.get("type") == "text":
+            elif kind == "text":
                 size = float(b.get("size", 14))
-                rect = self.fz.Rect(*[float(v) for v in b["rect"]])
+                rect = self._unrot_rect(page, b["rect"])
                 if rect.width < 40:
                     rect.x1 = rect.x0 + 40
                 if rect.height < size * 1.6:
                     rect.y1 = rect.y0 + size * 1.6
-                a = page.add_freetext_annot(rect, str(b["text"]), fontsize=size, fontname="helv",
-                                            text_color=col, align=0)
+                kw = dict(fontsize=size, fontname="helv", text_color=col, align=0)
+                if page.rotation:
+                    kw["rotate"] = page.rotation
+                try:
+                    a = page.add_freetext_annot(rect, str(b["text"]), **kw)
+                except TypeError:
+                    kw.pop("rotate", None)
+                    a = page.add_freetext_annot(rect, str(b["text"]), **kw)
                 if a is None:
                     raise RuntimeError("the text did not fit in its box")
             else:
                 raise RuntimeError("unknown annotation type")
             xref = a.xref
-            self._bump(path)
-            return {"xref": xref, "err": self._persist(path)}
+            self._dirty(path, e)
+            pdf_log(f"edit {kind} xref={xref} page={n + 1} rotation={page.rotation} file={os.path.basename(path)}")
+            return {"xref": xref, "err": None}
 
     def delete(self, path, n, xref):
         with self.lock:
             self._backup(path)
-            page = self._doc(path)[n]
+            e = self._entry(path)
+            page = e["doc"][n]
             a = page.load_annot(int(xref))
             if a is not None:
                 page.delete_annot(a)
-            self._bump(path)
-            return {"err": self._persist(path)}
+                self._dirty(path, e)
+                pdf_log(f"erase xref={xref} page={n + 1} file={os.path.basename(path)}")
+            return {"err": None}
+
+    def _write(self, path, data):
+        """Write bytes into the original file. Returns None or an error string."""
+        tmp = path + ".studylock.tmp"
+        last = ""
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.getsize(tmp) != len(data):
+                raise OSError("short write")
+            for _ in range(8):
+                try:
+                    os.replace(tmp, path)
+                    return None
+                except OSError as ex:
+                    last = str(ex)
+                    time.sleep(0.4)
+        except OSError as ex:
+            last = str(ex)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+        try:                                   # last resort: overwrite the file in place
+            with open(path, "r+b") as f:
+                f.seek(0)
+                f.write(data)
+                f.truncate()
+                f.flush()
+                os.fsync(f.fileno())
+            return None
+        except OSError as ex:
+            return f"{last or ex} ({ex})"
+
+    def _flush(self, path):
+        e = self.docs.get(path)
+        if not e or not e["dirty"]:
+            return None
+        self.saving = True
+        try:
+            d = e["doc"]
+            data = d.tobytes(garbage=0, deflate=True)
+            chk = self.fz.open(stream=data, filetype="pdf")
+            same = len(chk) == len(d)
+            chk.close()
+            if not same:
+                raise RuntimeError("safety check failed (page count differs), file left untouched")
+            err = self._write(path, data)
+            if err:
+                raise RuntimeError(err)
+            e["dirty"], e["err"] = False, None
+            pdf_log(f"saved {path} ({len(data)} bytes)")
+            return None
+        except Exception as ex:
+            e["err"] = str(ex)
+            e["t"] = time.monotonic()
+            pdf_log(f"SAVE FAILED {path}: {ex}")
+            return str(ex)
+        finally:
+            self.saving = False
+
+    def _saver(self):
+        while True:
+            time.sleep(0.25)
+            try:
+                with self.lock:
+                    now = time.monotonic()
+                    for p, e in list(self.docs.items()):
+                        if e["dirty"] and now - e["t"] >= (3.0 if e["err"] else self.SAVE_DELAY):
+                            self._flush(p)
+            except Exception as ex:
+                pdf_log(f"saver error: {ex}")
 
     def save(self, path):
         with self.lock:
-            return {"err": self._persist(path)} if path in self.docs else {"err": None}
+            return {"err": self._flush(path)}
+
+    def status(self):
+        """Lock-free snapshot for the page: are there unsaved edits / a save error?"""
+        es = list(self.docs.values())
+        return {"dirty": any(e["dirty"] for e in es),
+                "err": next((e["err"] for e in es if e["err"]), None)}
 
     def close_all(self):
+        """Save everything (with retries), close the PDFs. Returns warnings for the user."""
+        notes = []
         with self.lock:
-            for d in list(self.docs.values()):
+            for path, e in list(self.docs.items()):
+                if e["dirty"]:
+                    err = None
+                    for _ in range(4):
+                        err = self._flush(path)
+                        if not err:
+                            break
+                        time.sleep(0.8)
+                    if err:
+                        rescue = None
+                        try:
+                            os.makedirs(BACKUP_DIR, exist_ok=True)
+                            rescue = os.path.join(BACKUP_DIR, f"{os.path.basename(path)}.UNSAVED."
+                                                              f"{time.strftime('%Y%m%d-%H%M%S')}.pdf")
+                            with open(rescue, "wb") as f:
+                                f.write(e["doc"].tobytes(garbage=0, deflate=True))
+                        except Exception:
+                            rescue = None
+                        notes.append(f"Could not save your edits into {os.path.basename(path)}: {err}"
+                                     + (f"\nA copy with your edits was saved here:\n{rescue}" if rescue else ""))
                 try:
-                    d.close()
+                    e["doc"].close()
                 except Exception:
                     pass
             self.docs.clear()
+            self.cache.clear()
+        return notes
 
 
 class LectureServer:
@@ -2026,6 +2193,7 @@ class App:
         self.player_started = 0.0
         self.player_fail = 0
         self.lec_active = False
+        self.pdf_notices = []
         self.player_kind = None      # None | 'lecture' | 'pdf'
         self.pdf_list = []
         self.audio_was_playing = False
@@ -2337,6 +2505,7 @@ class App:
     def restart_app(self):
         exe = sys.executable
         self.stop_player()
+        self.flush_pdf_notices()
         self.blocker.stop()
         self.audio.close()
         save_data(self.data)
@@ -2457,12 +2626,20 @@ class App:
         self.enter_study_screen()
         self.beep()
 
+    def flush_pdf_notices(self):
+        """Tell the user if PDF edits could not be written into the original file."""
+        notes, self.pdf_notices = self.pdf_notices, []
+        if notes:
+            messagebox.showwarning(APP_NAME, "\n\n".join(notes))
+
     def show_main(self):
         self.root.deiconify()
         self.root.lift()
         self.root.attributes("-topmost", True)
         self.root.after(1500, lambda: self.root.attributes("-topmost", False))
         self.show_page(self.mode)
+        if self.pdf_notices:
+            self.root.after(400, self.flush_pdf_notices)
 
     def finish_study(self):
         self.leave_study_screen()
@@ -2567,6 +2744,7 @@ class App:
                 "doubts": len(self.data["doubts"]),
                 "doubt_list": [d["t"] for d in self.data["doubts"][-8:]],
                 "pdfs": [os.path.basename(p) for p in self.pdf_list],
+                "pdf": self.server.store.status() if self.server is not None else {},
                 "audio": {"loaded": bool(a.loaded and self.mode == "self"), "playing": bool(a.playing),
                           "volume": int(a.volume)}}
 
@@ -2596,7 +2774,7 @@ class App:
                 pass
         self.player = None
         if self.server is not None:
-            self.server.store.close_all()       # release the PDF files between sessions
+            self.pdf_notices.extend(self.server.store.close_all())     # saves edits, releases the PDF files
         if self.lec_active and self.lec_vid and self.lecture_pos > 0:
             self.data["settings"]["lecture"]["pos"][self.lec_vid] = max(0, self.lecture_pos - 3)
             save_data(self.data)
@@ -2773,6 +2951,7 @@ class App:
         if self.phase in ("break", "paused") and not messagebox.askyesno(APP_NAME, "A session is running. Quit anyway?"):
             return
         self.stop_player()
+        self.flush_pdf_notices()
         self.blocker.stop()
         self.audio.close()
         save_data(self.data)

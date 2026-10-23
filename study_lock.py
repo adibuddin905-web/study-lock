@@ -451,6 +451,7 @@ button,select,input,textarea{font-family:inherit}
     <button class="tool" id="t-text" onclick="setTool('text')">Text</button>
     <button class="tool" id="t-erase" onclick="setTool('erase')">Eraser</button>
     <span id="sw"></span>
+    <span id="hlmode" style="display:none"><button class="tool on" id="hm-free" onclick="setHlMode('free')" title="Draw freely like a marker">Free</button> <button class="tool" id="hm-text" onclick="setHlMode('text')" title="Drag over text: highlights whole words, line by line">Text</button></span>
     <input type="range" id="thick" style="display:none"><span id="thv"></span>
     <span class="vsep"></span>
     <button class="tool" onclick="undo()">Undo</button>
@@ -623,7 +624,7 @@ function syncPause(){
 }
 
 /* ================= PDF reader: tools ================= */
-var tool='hand',panes=[],activePane=null,undoStack=[],tb=null,nightOn=false;
+var tool='hand',hlMode='free',panes=[],activePane=null,undoStack=[],tb=null,nightOn=false,wordsCache={},sel=null;
 var PAL={hl:[[1,0.88,0.1],[0.45,0.9,0.4],[1,0.55,0.75],[0.45,0.75,1],[1,0.6,0.2]],
          pen:[[0.93,0.18,0.18],[0.2,0.4,0.95],[0.05,0.05,0.05],[0.1,0.65,0.3]],
          text:[[0,0,0],[0.85,0.1,0.1],[0.15,0.35,0.9],[0.1,0.55,0.25]]};
@@ -636,12 +637,51 @@ function setTool(t){
 }
 function buildOptions(){
  var sw=$('sw');sw.innerHTML='';var th=$('thick'),tv=$('thv');
+ $('hlmode').style.display=(tool==='hl')?'':'none';
  if(!OPT[tool]){th.style.display='none';tv.textContent='';return;}
  var o=OPT[tool];
  PAL[tool].forEach(function(c,i){var b=document.createElement('button');b.className='dot'+(i===o.c?' on':'');b.style.background=rgb(c);b.onclick=function(){o.c=i;buildOptions();};sw.appendChild(b);});
  th.style.display='';th.min=o.min;th.max=o.max;th.step=o.step;th.value=o.w;
  tv.textContent=o.w+(tool==='text'?' pt':' pt');
  th.oninput=function(){o.w=parseFloat(this.value);tv.textContent=o.w+' pt';};
+ if(tool==='hl'&&hlMode==='text'){th.style.display='none';tv.textContent='';}
+}
+function setHlMode(m){
+ hlMode=m;$('hm-free').classList.toggle('on',m==='free');$('hm-text').classList.toggle('on',m==='text');
+ buildOptions();if(m==='text')prefetchWords();
+}
+/* ---- text-snapping highlighter: word boxes come from the PDF's text layer ---- */
+function ensureWords(P,n){
+ var key=P.doc+':'+n;
+ if(!wordsCache[key])wordsCache[key]=api('/words/'+P.doc+'/'+n).then(function(w){return Array.isArray(w)?w:[];}).catch(function(){return [];});
+ return wordsCache[key];
+}
+function prefetchWords(){panes.forEach(function(P){var sc=P.scrollEl,top=sc.scrollTop,vh=sc.clientHeight;
+ P.pages.forEach(function(pg,n){var d=pg.el;if(d.offsetTop+d.offsetHeight>=top&&d.offsetTop<=top+vh)ensureWords(P,n);});});}
+function nearestWord(ws,p){
+ var best=-1,bd=1e18;
+ for(var i=0;i<ws.length;i++){var w=ws[i];
+  var dx=p[0]<w[0]?w[0]-p[0]:(p[0]>w[2]?p[0]-w[2]:0),dy=p[1]<w[1]?w[1]-p[1]:(p[1]>w[3]?p[1]-w[3]:0),d=dx*dx+dy*dy*4;
+  if(d<bd){bd=d;best=i;if(d===0)break;}}
+ return best;
+}
+function mergeLines(ws,a,b){
+ var out=[],r=null;
+ for(var i=a;i<=b;i++){var w=ws[i];
+  if(r&&Math.abs((w[1]+w[3])/2-(r[1]+r[3])/2)<(r[3]-r[1])*0.6){r[0]=Math.min(r[0],w[0]);r[1]=Math.min(r[1],w[1]);r[2]=Math.max(r[2],w[2]);r[3]=Math.max(r[3],w[3]);}
+  else{if(r)out.push(r);r=[w[0],w[1],w[2],w[3]];}}
+ if(r)out.push(r);return out;
+}
+function selRects(q){
+ if(q.rect)return [[Math.min(q.start[0],q.last[0]),Math.min(q.start[1],q.last[1]),Math.max(q.start[0],q.last[0]),Math.max(q.start[1],q.last[1])]];
+ if(q.i0<0||q.i1<0)return [];
+ return mergeLines(q.ws,Math.min(q.i0,q.i1),Math.max(q.i0,q.i1));
+}
+function drawSel(){
+ if(!sel||!sel.ws)return;
+ var cv=sel.pg.ov,c=cv.getContext('2d'),k=cv.width/sel.P.info.pages[sel.n][0];
+ c.clearRect(0,0,cv.width,cv.height);c.fillStyle=rgb(PAL.hl[OPT.hl.c],0.4);
+ selRects(sel).forEach(function(r){c.fillRect(r[0]*k,r[1]*k,(r[2]-r[0])*k,(r[3]-r[1])*k);});
 }
 function applyToolTo(P){P.pages.forEach(function(pg){var c=pg.ov;c.style.pointerEvents=(tool==='hand')?'none':'auto';c.style.cursor=tool==='erase'?'cell':(tool==='text'?'text':'crosshair');});}
 function toggleNight(){nightOn=!nightOn;panes.forEach(function(P){P.pagesEl.classList.toggle('night',nightOn);});$('nightb').classList.toggle('on',nightOn);}
@@ -814,17 +854,25 @@ function attach(P,pg,n){
   e.preventDefault();activePane=P;
   if(tool==='text'){startText(P,pg,n,e);return;}
   cv.setPointerCapture(e.pointerId);var p=pt(P,pg,e,n);
-  if(tool==='hl'||tool==='pen'){stroke={P:P,pg:pg,n:n,kind:tool,pts:[p],css:[[e.offsetX,e.offsetY]]};drawStroke();}
+  if(tool==='hl'&&hlMode==='text'){
+   sel={P:P,pg:pg,n:n,ws:null,i0:-1,i1:-1,last:p,start:p,moved:false,rect:false};
+   ensureWords(P,n).then(function(ws){if(!sel||sel.pg!==pg)return;sel.ws=ws;sel.rect=(ws.length===0);sel.i0=nearestWord(ws,sel.start);sel.i1=nearestWord(ws,sel.last);drawSel();});}
+  else if(tool==='hl'||tool==='pen'){stroke={P:P,pg:pg,n:n,kind:tool,pts:[p],css:[[e.offsetX,e.offsetY]]};drawStroke();}
   else if(tool==='erase'){eraseAt(P,n,p);}
  });
  cv.addEventListener('pointermove',function(e){
   if(stroke&&stroke.pg===pg){stroke.pts.push(pt(P,pg,e,n));stroke.css.push([e.offsetX,e.offsetY]);drawStroke();}
+  else if(sel&&sel.pg===pg){sel.last=pt(P,pg,e,n);
+   if(Math.abs(sel.last[0]-sel.start[0])+Math.abs(sel.last[1]-sel.start[1])>3)sel.moved=true;
+   if(sel.ws){if(!sel.rect)sel.i1=nearestWord(sel.ws,sel.last);drawSel();}}
  });
  cv.addEventListener('pointerup',function(){
+  if(sel&&sel.pg===pg){var q=sel;sel=null;var rs=(q.moved&&q.ws)?selRects(q):[];
+   if(rs.length)commit(P,n,{type:'highlight',rects:rs,color:PAL.hl[OPT.hl.c]});else clearOv(pg.ov);return;}
   if(stroke&&stroke.pg===pg){var s=stroke;stroke=null;var o=s.kind==='hl'?OPT.hl:OPT.pen;
    commit(P,n,{type:'ink',strokes:[simplify(s.pts)],color:PAL[s.kind][o.c],width:o.w,opacity:s.kind==='hl'?o.alpha:1});}
  });
- cv.addEventListener('pointercancel',function(){stroke=null;clearOv(cv);});
+ cv.addEventListener('pointercancel',function(){stroke=null;sel=null;clearOv(cv);});
 }
 function commit(P,n,body){
  body.doc=P.doc;body.page=n;setSaved('saving');
@@ -1100,7 +1148,7 @@ class PdfStore:
     def words(self, path, n):
         with self.lock:
             page = self._doc(path)[n]
-            return [[round(w[0], 2), round(w[1], 2), round(w[2], 2), round(w[3], 2)]
+            return [[round(v, 2) for v in self._visible(page, self.fz.Rect(w[0], w[1], w[2], w[3]))]
                     for w in page.get_text("words")]
 
     def annots(self, path, n):

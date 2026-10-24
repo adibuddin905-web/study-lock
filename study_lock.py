@@ -85,7 +85,7 @@ def default_settings():
         "keys": {},
         "self": {"study": 50, "break": 10, "cycles": 4, "audio": "", "volume": 70,
                  "pdfs": [], "pdf_state": {}, "pdf_night": True},
-        "lecture": {"study": 50, "break": 10, "cycles": 2, "url": "", "pos": {},
+        "lecture": {"study": 50, "break": 10, "cycles": 2, "url": "", "queue": [], "done": [], "titles": {}, "pos": {},
                     "pdfs": [], "split": 55, "swap": False, "speed": 1.0},
     }
 
@@ -123,6 +123,9 @@ def load_data():
     for mode in ("self", "lecture"):
         if isinstance(old.get(mode), dict):
             new[mode].update(old[mode])
+    lec = new["lecture"]
+    if not lec.get("queue") and lec.get("url") and parse_youtube(lec["url"])[0]:
+        lec["queue"] = [lec["url"]]            # the single link of older versions becomes the first lecture
     d["settings"] = new
     return d
 
@@ -409,6 +412,13 @@ button,select,input,textarea{font-family:inherit}
 #dlist li{padding:6px 8px;background:var(--sur2);border-radius:7px;margin-bottom:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #aud{display:none;align-items:center;gap:10px;margin:0 0 14px}
 #vol{flex:1}
+#qlist{list-style:none;margin:0;padding:0;font-size:12px;max-height:190px;overflow:auto}
+#qlist li{display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--sur2);border-radius:7px;margin-bottom:5px;cursor:pointer}
+#qlist li.cur{background:rgba(163,113,247,.22);border:1px solid var(--vio)}
+#qlist li span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#qlist li button{border:0;background:transparent;color:var(--mut);font-size:14px;cursor:pointer}
+#qin{flex:1;min-width:0;background:var(--sur2);border:1px solid var(--line);border-radius:9px;color:var(--text);font-size:13px;padding:8px 10px;outline:none;user-select:text}
+#qin:focus{border-color:var(--accent)}
 .krow{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px;font-size:12px}
 .keybtn{min-width:96px;border:1px solid var(--line);background:var(--sur2);color:var(--text);border-radius:8px;padding:6px 10px;font-size:12px;font-weight:700;cursor:pointer}
 .keybtn.cap{border-color:var(--accent);color:var(--accent)}
@@ -436,9 +446,9 @@ button,select,input,textarea{font-family:inherit}
    <div id="yt"></div><div id="shield" onclick="toggle()"></div>
    <div class="hud" id="hud">
     <div id="seekrow"><span id="cur">0:00</span><div id="bar2"><div id="track"><div id="fill"></div></div></div><span id="dur">0:00</span></div>
-    <div id="vrow"><button class="b" onclick="seek(-30)">&minus;30s</button><button class="b" onclick="seek(-10)">&minus;10s</button>
+    <div id="vrow"><button class="b" id="qprev" style="display:none" onclick="prevLecture()">&laquo; Prev lecture</button><button class="b" onclick="seek(-30)">&minus;30s</button><button class="b" onclick="seek(-10)">&minus;10s</button>
      <button class="b acc" id="pp2" onclick="toggle()">Pause</button>
-     <button class="b" onclick="seek(10)">+10s</button><button class="b" onclick="seek(30)">+30s</button></div>
+     <button class="b" onclick="seek(10)">+10s</button><button class="b" onclick="seek(30)">+30s</button><button class="b" id="qnext" style="display:none" onclick="nextLecture(false)">Next lecture &raquo;</button></div>
    </div>
    <div class="msg" id="vmsg"></div>
   </div>
@@ -470,6 +480,8 @@ button,select,input,textarea{font-family:inherit}
   <div class="lbl">Doubts</div>
   <input id="inp" placeholder="Write a doubt and press Enter" autocomplete="off">
   <ul id="dlist"></ul>
+  <div id="lecs" style="display:none;margin-top:14px"><div class="lbl">Lectures in this session</div><ul id="qlist"></ul>
+   <div style="display:flex;gap:6px;margin-top:6px"><input id="qin" placeholder="Paste another YouTube link"><button class="b acc" onclick="addLecture()">Add</button></div></div>
   <div id="keys" style="display:none;margin-top:14px"><div class="lbl">Video shortcuts (click, then press a key)</div><div id="klist"></div><button class="b" style="margin-top:6px" onclick="resetKeys()">Reset to defaults</button></div>
  </div>
 </div>
@@ -554,7 +566,7 @@ function runAction(a){
 }
 
 /* ================= video (YouTube IFrame API) ================= */
-var player=null,ready=false,started=false,ended=false,vpaused=false,lastSave=0,lastMove=Date.now(),vhover=false,wasPlaying=false,speed=1,speedDirect=false,warnedSpeed=false;
+var queue=[],curVid='',qSig='',player=null,ready=false,started=false,ended=false,vpaused=false,lastSave=0,lastMove=Date.now(),vhover=false,wasPlaying=false,speed=1,speedDirect=false,warnedSpeed=false;
 function vshow(h){var m=$('vmsg');m.innerHTML=h;m.style.display='block';}
 function vhide(){$('vmsg').style.display='none';}
 function begin(){vhide();try{player.playVideo();}catch(e){}}
@@ -563,6 +575,30 @@ function toggle(){
  if(ended){ended=false;vhide();player.seekTo(0,true);player.playVideo();return;}
  var st=player.getPlayerState();
  if(st===1||st===3){player.pauseVideo();}else{player.playVideo();}
+}
+function qIdx(){for(var i=0;i<queue.length;i++)if(queue[i].id===curVid)return i;return -1;}
+function savePos(){if(ready&&curVid){try{api('/pos',{v:curVid,t:player.getCurrentTime()});}catch(e){}}}
+function playQ(i,auto){
+ if(i<0||i>=queue.length||!ready)return;
+ var it=queue[i];if(it.id!==curVid&&!auto)savePos();
+ curVid=it.id;ended=false;vhide();
+ player.loadVideoById({videoId:it.id,startSeconds:Math.floor(it.start||0)});
+ renderQueue();toast((auto?'Next lecture: ':'Lecture ')+(i+1)+' of '+queue.length+(it.title?' - '+it.title:''),3500);
+}
+function nextLecture(auto){var i=qIdx();if(i>=0&&i<queue.length-1){playQ(i+1,auto);return true;}return false;}
+function prevLecture(){var i=qIdx();if(i>0)playQ(i-1,false);}
+function addLecture(){var v=$('qin').value.trim();if(!v)return;api('/queue_add',{url:v});$('qin').value='';toast('Lecture added to the list',2500);}
+function delLecture(id){api('/queue_del',{id:id});}
+$('qin').addEventListener('keydown',function(e){if(e.key==='Enter')addLecture();});
+function renderQueue(){
+ var ul=$('qlist');ul.innerHTML='';
+ queue.forEach(function(it,i){
+  var li=document.createElement('li');if(it.id===curVid)li.className='cur';
+  var sp=document.createElement('span');sp.textContent=(i+1)+'. '+(it.title||('Lecture '+(i+1)))+(it.done?'  \u2713':'');li.appendChild(sp);
+  li.onclick=function(){if(it.id!==curVid)playQ(i,false);};
+  if(it.id!==curVid){var x=document.createElement('button');x.textContent='\u00d7';x.title='Remove from the list';x.onclick=function(e){e.stopPropagation();delLecture(it.id);};li.appendChild(x);}
+  ul.appendChild(li);});
+ var multi=queue.length>1;$('qprev').style.display=multi?'':'none';$('qnext').style.display=multi?'':'none';
 }
 function seek(d){if(!ready||prayerPaused)return;var t=player.getCurrentTime()+d,dur=player.getDuration();
  t=Math.max(0,dur>5?Math.min(t,dur-2):t);player.seekTo(t,true);}
@@ -596,12 +632,17 @@ setInterval(function(){
 function onReady(){ready=true;player.playVideo();applyRate();
  setTimeout(function(){if(!started)vshow('<button class="b acc" style="font-size:15px;padding:12px 22px" onclick="begin()">&#9654; Start lecture</button>');},4000);}
 function onState(e){var st=e.data;
- if(st===1){started=true;ended=false;vpaused=false;vhide();$('pp2').textContent='Pause';$('vpp').textContent='Pause video';applyRate();}
+ if(st===1){started=true;ended=false;vpaused=false;vhide();try{var vd=player.getVideoData();if(vd&&vd.title){var qi=qIdx();if(qi>=0&&!queue[qi].title){queue[qi].title=vd.title;renderQueue();}}}catch(e){}$('pp2').textContent='Pause';$('vpp').textContent='Pause video';applyRate();}
  else if(st===2){vpaused=started;$('pp2').textContent='Resume';$('vpp').textContent='Play video';}
- else if(st===0){ended=true;vpaused=true;$('pp2').textContent='Replay';vshow('Lecture finished.<br>The timer is still running - use the time for your doubts or notes.');}}
+ else if(st===0){
+  api('/vdone',{v:curVid});
+  if(nextLecture(true))return;
+  ended=true;vpaused=true;$('pp2').textContent='Replay';
+  vshow((queue.length>1?'All '+queue.length+' lectures are finished.':'Lecture finished.')+'<br>The timer is still running. Add another link in the Doubts panel, or use the time for your doubts and notes.');}}
 function onError(e){vshow('This video cannot be played here (error '+e.data+').<br>The owner may have disabled embedding, or the link is wrong.<br>Try another video after this session.');}
 function loadYT(){
  window.onYouTubeIframeAPIReady=function(){
+  curVid=S.video_id;
   player=new YT.Player('yt',{videoId:S.video_id,playerVars:{autoplay:1,controls:0,disablekb:1,fs:0,rel:0,modestbranding:1,playsinline:1,iv_load_policy:3,start:Math.floor(S.start||0)},
    events:{onReady:onReady,onStateChange:onState,onError:onError}});};
  var sc=document.createElement('script');sc.src='https://www.youtube.com/iframe_api';
@@ -611,7 +652,7 @@ setInterval(function(){
  if(!ready)return;
  var t=player.getCurrentTime(),d=player.getDuration();
  $('cur').textContent=fmt(t);$('dur').textContent=fmt(d);$('fill').style.width=(d>0?Math.min(100,t/d*100):0)+'%';
- if(!prayerPaused&&Date.now()-lastSave>4000){lastSave=Date.now();api('/pos',{t:t});}
+ if(!prayerPaused&&Date.now()-lastSave>4000){lastSave=Date.now();api('/pos',{v:curVid,t:t});}
 },300);
 function syncPause(){
  var p=(S.phase==='paused');
@@ -966,8 +1007,16 @@ document.addEventListener('contextmenu',function(e){e.preventDefault();});
 
 /* ================= state sync / boot ================= */
 var lastPdfErr='';
+function syncQueue(){
+ var q=S.queue||[],sig=q.map(function(x){return x.id+(x.title?'t':'')+(x.done?'d':'');}).join(',')+'|'+curVid;
+ if(sig===qSig)return;qSig=sig;
+ var old={};queue.forEach(function(it){if(it.title)old[it.id]=it.title;});
+ queue=q.map(function(x){return {id:x.id,start:x.start,title:x.title||old[x.id]||'',done:x.done};});
+ renderQueue();
+ if(ended&&hasVideo){var i=qIdx();if(i>=0&&i<queue.length-1){ended=false;playQ(i+1,true);}}
+}
 function sync(s){
- S=s;syncPause();
+ S=s;syncPause();if(hasVideo)syncQueue();
  if(s.pdf){var sv=$('saved');
   if(s.pdf.err){if(s.pdf.err!==lastPdfErr){lastPdfErr=s.pdf.err;toast('Could not save PDF edits (will keep retrying): '+s.pdf.err,9000);}
    sv.textContent='Not saved';sv.style.color='#f85149';sv.title=s.pdf.err;}
@@ -995,7 +1044,7 @@ api('/state').then(function(s){
  $('vpp').style.display=hasVideo?'':'none';
  $('speedbox').style.display=hasVideo?'flex':'none';
  keys=JSON.parse(JSON.stringify(DEFAULT_KEYS));Object.keys(S.keys||{}).forEach(function(a){if(a in keys)keys[a]=S.keys[a];});
- rebuildKeyMap();buildKeyUI();$('keys').style.display=hasVideo?'block':'none';
+ rebuildKeyMap();buildKeyUI();$('keys').style.display=hasVideo?'block':'none';$('lecs').style.display=hasVideo?'block':'none';
  speed=Math.max(0.5,Math.min(3,S.speed||1));$('spv').textContent=speed.toFixed(1)+'x';
  applyLayout();
  if(hasVideo)loadYT();
@@ -1442,7 +1491,13 @@ class LectureServer:
                     if path == "/doubt":
                         a.q_doubts.put(body)
                     elif path == "/pos":
-                        a.lecture_pos = float(body.get("t", 0) or 0)
+                        a.set_lec_pos(body.get("v"), body.get("t", 0) or 0)
+                    elif path == "/vdone":
+                        a.q_cmds.put(("lec", "vdone", body.get("v")))
+                    elif path == "/queue_add":
+                        a.q_cmds.put(("lec", "qadd", body.get("url")))
+                    elif path == "/queue_del":
+                        a.q_cmds.put(("lec", "qdel", body.get("id")))
                     elif path == "/pause":
                         a.q_cmds.put("pause")
                     elif path == "/resume":
@@ -1923,23 +1978,31 @@ class SessionView(tk.Frame):
         tk.Label(pi, text=hint, bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w").pack(anchor="w", pady=(8, 0))
 
     def _build_lecture_card(self, right, st):
-        lo, li = card(right, "YouTube lecture")
+        lo, li = card(right, "YouTube lectures (played one after another)")
         lo.pack(fill="x", pady=(12, 0))
         row = tk.Frame(li, bg=SURFACE)
         row.pack(fill="x")
-        self.v_url = tk.StringVar(value=st["url"])
+        self.v_url = tk.StringVar(value="")
         e = make_entry(row, self.v_url, accent=VIOLET)
         e.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
-        e.bind("<FocusOut>", lambda ev: self.update_lec_label())
+        e.bind("<Return>", lambda ev: self.lec_add())
         e.bind("<KeyRelease>", lambda ev: self.update_lec_label())
         Btn(row, "Paste", self.paste_url, "secondary").pack(side="left", padx=(0, 6))
-        Btn(row, "Reset position", self.reset_pos, "secondary").pack(side="left")
+        Btn(row, "Add", self.lec_add, "violet").pack(side="left")
+        lrow = tk.Frame(li, bg=SURFACE)
+        lrow.pack(fill="x", pady=(8, 0))
+        self.lb_lec = make_listbox(lrow, height=2)
+        self.lb_lec.pack(side="left", fill="x", expand=True)
+        col = tk.Frame(lrow, bg=SURFACE)
+        col.pack(side="left", padx=(10, 0))
+        brow = tk.Frame(col, bg=SURFACE)
+        brow.pack()
+        Btn(brow, "Remove", self.lec_remove, "secondary", size=9, padx=10, pady=5).pack(side="left")
+        Btn(brow, "\u2191", lambda: self.lec_move(-1), "secondary", size=9, padx=9, pady=5).pack(side="left", padx=(5, 0))
+        Btn(brow, "\u2193", lambda: self.lec_move(1), "secondary", size=9, padx=9, pady=5).pack(side="left", padx=(5, 0))
+        Btn(col, "Reset progress", self.lec_reset, "secondary", size=9, padx=10, pady=5).pack(fill="x", pady=(5, 0))
         self.lbl_lec = tk.Label(li, text="", bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w")
-        self.lbl_lec.pack(anchor="w", pady=(8, 0))
-        tk.Label(li, text="Pause, resume, seek and change speed any time. The focus timer keeps running while "
-                          "paused. Prayer break pauses everything.",
-                 bg=SURFACE, fg=MUTED, font=(FONT, 9), anchor="w", justify="left",
-                 wraplength=560).pack(anchor="w", pady=(2, 0))
+        self.lbl_lec.pack(anchor="w", pady=(6, 0))
 
     def paste_url(self):
         try:
@@ -1948,26 +2011,93 @@ class SessionView(tk.Frame):
             pass
         self.update_lec_label()
 
-    def reset_pos(self):
-        vid, _ = parse_youtube(self.v_url.get())
-        if vid:
-            self.app.data["settings"]["lecture"]["pos"].pop(vid, None)
+    def _lec(self):
+        return self.app.data["settings"]["lecture"]
+
+    def lec_add(self, silent=False):
+        url = self.v_url.get().strip()
+        if not url:
+            return False
+        vid, _ = parse_youtube(url)
+        if not vid:
+            if not silent:
+                self.lbl_lec.config(text="This does not look like a single YouTube video link.", fg=WARN)
+            return False
+        lec = self._lec()
+        if any(parse_youtube(u)[0] == vid for u in lec["queue"]):
+            self.lbl_lec.config(text="This lecture is already in the list.", fg=WARN)
+            self.v_url.set("")
+            return True
+        lec["queue"].append(url)
+        self.v_url.set("")
+        save_data(self.app.data)
+        self.app.fetch_title(vid)
+        self.refresh_lec_list()
+        return True
+
+    def lec_remove(self):
+        sel = self.lb_lec.curselection()
+        if not sel:
+            self.lbl_lec.config(text="Select a lecture in the list first.", fg=WARN)
+            return
+        del self._lec()["queue"][sel[0]]
+        save_data(self.app.data)
+        self.refresh_lec_list()
+
+    def lec_move(self, d):
+        sel = self.lb_lec.curselection()
+        q = self._lec()["queue"]
+        if not sel:
+            return
+        i, j = sel[0], sel[0] + d
+        if 0 <= j < len(q):
+            q[i], q[j] = q[j], q[i]
             save_data(self.app.data)
+            self.refresh_lec_list()
+            self.lb_lec.selection_set(j)
+
+    def lec_reset(self):
+        lec = self._lec()
+        for u in lec["queue"]:
+            vid, _ = parse_youtube(u)
+            lec["pos"].pop(vid, None)
+        lec["done"] = []
+        save_data(self.app.data)
+        self.refresh_lec_list()
+
+    def refresh_lec_list(self):
+        if self.mode != "lecture":
+            return
+        lec = self._lec()
+        self.lb_lec.delete(0, "end")
+        for i, u in enumerate(lec["queue"]):
+            vid, t0 = parse_youtube(u)
+            title = lec["titles"].get(vid, "") or u
+            if vid in lec["done"]:
+                tag = "   \u2713 watched"
+            elif lec["pos"].get(vid):
+                tag = f"   (resume {vt(lec['pos'][vid])})"
+            else:
+                tag = ""
+            self.lb_lec.insert("end", f"  {i + 1}. {title[:70]}{tag}")
         self.update_lec_label()
 
     def update_lec_label(self):
         if self.mode != "lecture":
             return
         url = self.v_url.get().strip()
-        vid, t0 = parse_youtube(url)
-        if not url:
-            self.lbl_lec.config(text="Paste the link of a single YouTube video.", fg=MUTED)
-        elif not vid:
-            self.lbl_lec.config(text="This does not look like a single YouTube video link.", fg=WARN)
+        n = len(self._lec()["queue"])
+        if url:
+            vid, _ = parse_youtube(url)
+            if vid:
+                self.lbl_lec.config(text="Link OK. Press Add (or Enter) to put it in the list.", fg=GOOD)
+            else:
+                self.lbl_lec.config(text="This does not look like a single YouTube video link.", fg=WARN)
+        elif n == 0:
+            self.lbl_lec.config(text="Paste a YouTube link and press Add. You can add several lectures.", fg=MUTED)
         else:
-            saved = self.app.data["settings"]["lecture"]["pos"].get(vid)
-            pos = saved if saved is not None else t0
-            self.lbl_lec.config(text=f"Link OK  \u00b7  starts at {vt(pos)}", fg=GOOD)
+            self.lbl_lec.config(text=f"{n} lecture(s) in the list. They play in this order; you can add more "
+                                     "during the session.", fg=MUTED)
 
     # ---- rendering (called every tick)
     def _layout_buttons(self, key):
@@ -2249,8 +2379,9 @@ class App:
         self.pdf_list = []
         self.audio_was_playing = False
         self.lec_vid = None
-        self.lec_start = 0.0
-        self.lecture_pos = 0.0
+        self.lec_queue = []          # [{"url", "id", "t0"}] for the running lecture session
+        self.lec_pos = {}            # live positions reported by the player {video id: seconds}
+        self.lec_list_dirty = False
 
         root.title(APP_NAME)
         root.geometry("1060x740")
@@ -2269,8 +2400,12 @@ class App:
 
         self.refresh_doubts()
         self.refresh_pdf_list()
+        self.views["lecture"].refresh_lec_list()
+        for u in self.data["settings"]["lecture"]["queue"]:
+            vid = parse_youtube(u)[0]
+            if vid and vid not in self.data["settings"]["lecture"]["titles"]:
+                self.fetch_title(vid)
         self.refresh_progress()
-        self.views["lecture"].update_lec_label()
         dark_titlebar(root)
         self.show_page("self")
         if self.updater.frozen:
@@ -2588,6 +2723,8 @@ class App:
                     self.sync_audio_buttons()
                 elif c[1] == "volume" and c[2] is not None:
                     self.on_volume(c[2])
+            elif isinstance(c, tuple) and c[0] == "lec":
+                self.lec_cmd(c[1], c[2])
             elif isinstance(c, tuple) and c[0] == "extend":
                 self.extend_session(c[1])
             elif isinstance(c, tuple) and c[0] == "speed":
@@ -2620,17 +2757,24 @@ class App:
         self.pdf_list = self.pdf_paths(mode)
         extra = ""
         if mode == "lecture":
-            vid, t0 = parse_youtube(v.v_url.get())
-            if not vid:
-                messagebox.showerror(APP_NAME, "Please paste a valid link to a single YouTube video.")
+            if v.v_url.get().strip() and not v.lec_add(silent=True):
+                messagebox.showerror(APP_NAME, "The link in the box is not a valid YouTube video link.")
                 return
-            saved = self.data["settings"]["lecture"]["pos"].get(vid)
-            self.lec_vid = vid
-            self.lec_start = float(saved if saved is not None else t0)
-            self.lecture_pos = self.lec_start
+            queue = self.build_lec_queue()
+            if not queue:
+                messagebox.showerror(APP_NAME, "Add at least one YouTube lecture link first.")
+                return
+            lec = self.data["settings"]["lecture"]
+            first = next((it for it in queue if it["id"] not in lec["done"]), None)
+            if first is None:                      # everything was watched: start again from the first one
+                lec["done"] = []
+                first = queue[0]
+            self.lec_queue, self.lec_pos = queue, {}
+            self.lec_vid = first["id"]
             self.lec_active = True
             self.player_kind = "room"
-            extra = "A YouTube lecture will play full screen. You can pause, resume and seek.\n"
+            extra = (f"{len(queue)} YouTube lecture(s) will play one after another, full screen. "
+                     "You can pause, resume and seek.\n")
             if self.pdf_list:
                 extra += f"{len(self.pdf_list)} PDF file(s) will open beside the video (split screen).\n"
             extra += "\n"
@@ -2650,8 +2794,6 @@ class App:
             return
         s = self.data["settings"][mode]
         s.update(study=study, cycles=cyc, **{"break": brk})
-        if mode == "lecture":
-            s["url"] = v.v_url.get().strip()
         save_data(self.data)
         self.mode = mode
         self.study_min, self.break_min = study, brk
@@ -2811,11 +2953,77 @@ class App:
             self.root.bell()
 
     # ---------- lecture player process
+    def build_lec_queue(self):
+        out = []
+        for u in self.data["settings"]["lecture"]["queue"]:
+            vid, t0 = parse_youtube(u)
+            if vid and all(it["id"] != vid for it in out):
+                out.append({"url": u, "id": vid, "t0": t0})
+        return out
+
+    def _lec_start(self, it):
+        lec = self.data["settings"]["lecture"]
+        if it["id"] in self.lec_pos:
+            return float(self.lec_pos[it["id"]])
+        saved = lec["pos"].get(it["id"])
+        return float(saved if saved is not None else it.get("t0", 0))
+
+    def set_lec_pos(self, vid, t):             # called from the server thread
+        if any(it["id"] == vid for it in list(self.lec_queue)):
+            self.lec_pos[vid] = max(0.0, float(t))
+            self.lec_vid = vid
+
+    def fetch_title(self, vid):
+        def work():
+            try:
+                u = ("https://www.youtube.com/oembed?format=json&url="
+                     + urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}", safe=""))
+                with urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": APP_NAME}),
+                                            timeout=10) as r:
+                    t = json.load(r).get("title", "")
+                if t:
+                    self.data["settings"]["lecture"]["titles"][vid] = t
+                    self.lec_list_dirty = True
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def lec_cmd(self, kind, arg):
+        """Queue changes made from the study room (main thread)."""
+        lec = self.data["settings"]["lecture"]
+        if kind == "qadd":
+            vid, t0 = parse_youtube(str(arg or ""))
+            if not vid or any(it["id"] == vid for it in self.lec_queue):
+                return
+            lec["queue"].append(str(arg).strip())
+            self.lec_queue.append({"url": str(arg).strip(), "id": vid, "t0": t0})
+            self.fetch_title(vid)
+        elif kind == "qdel":
+            if arg == self.lec_vid:
+                return
+            self.lec_queue = [it for it in self.lec_queue if it["id"] != arg]
+            lec["queue"] = [u for u in lec["queue"] if parse_youtube(u)[0] != arg]
+        elif kind == "vdone":
+            if arg not in lec["done"]:
+                lec["done"].append(arg)
+            lec["pos"].pop(arg, None)
+            self.lec_pos.pop(arg, None)
+            ids = [it["id"] for it in self.lec_queue]
+            if arg in ids and ids.index(arg) < len(ids) - 1:
+                self.lec_vid = ids[ids.index(arg) + 1]
+        save_data(self.data)
+        self.lec_list_dirty = True
+
     def lecture_state(self):          # called from the server thread
         a = self.audio
         lec = self.data["settings"]["lecture"]
+        q = list(self.lec_queue)
+        cur = next((it for it in q if it["id"] == self.lec_vid), None)
         return {"video_id": self.lec_vid, "has_video": bool(self.lec_active), "mode": self.mode,
-                "start": self.lec_start, "split": lec.get("split", 55), "swap": lec.get("swap", False),
+                "start": self._lec_start(cur) if cur else 0,
+                "queue": [{"id": it["id"], "start": self._lec_start(it),
+                           "title": lec["titles"].get(it["id"], ""), "done": it["id"] in lec["done"]} for it in q],
+                "split": lec.get("split", 55), "swap": lec.get("swap", False),
                 "speed": lec.get("speed", 1.0), "keys": self.data["settings"].get("keys", {}),
                 "phase": self.phase, "phase_end": self.phase_end * 1000,
                 "paused_rem": self.paused_rem, "phase_total": self.phase_total,
@@ -2830,8 +3038,6 @@ class App:
     def launch_player(self):
         if self.server is None:
             self.server = LectureServer(self)
-        if self.lec_active:
-            self.lec_start = self.lecture_pos
         cmd = [sys.executable]
         if not getattr(sys, "frozen", False):
             cmd.append(os.path.abspath(__file__))
@@ -2854,9 +3060,15 @@ class App:
         self.player = None
         if self.server is not None:
             self.pdf_notices.extend(self.server.store.close_all())     # saves edits, releases the PDF files
-        if self.lec_active and self.lec_vid and self.lecture_pos > 0:
-            self.data["settings"]["lecture"]["pos"][self.lec_vid] = max(0, self.lecture_pos - 3)
+        if self.lec_active:
+            lec = self.data["settings"]["lecture"]
+            for vid, t in list(self.lec_pos.items()):
+                if vid in lec["done"]:
+                    lec["pos"].pop(vid, None)
+                elif t > 0:
+                    lec["pos"][vid] = max(0, t - 3)
             save_data(self.data)
+            self.lec_list_dirty = True
 
     def retry_player(self):
         self.player_fail = 0
@@ -3016,6 +3228,9 @@ class App:
         self.drain_cmds()
         if self.updater.dirty:
             self.update_ui()
+        if self.lec_list_dirty:
+            self.lec_list_dirty = False
+            self.views["lecture"].refresh_lec_list()
 
         if self.phase == "study":
             self.add_study(d)
